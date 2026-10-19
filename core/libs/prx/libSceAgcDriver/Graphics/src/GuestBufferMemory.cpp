@@ -1592,7 +1592,8 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         }
         return nullptr;
     }
-    if (!state.retireAllowed && ((first != state.imports.end() && first->first < base + bytes) || live + bytes > budget)) {
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> importSpan{{{base & ~std::uint64_t{65535}, (base + bytes + 65535) & ~std::uint64_t{65535}}}};
+    if (!state.retireAllowed && ((first != state.imports.end() && first->first < base + bytes) || live + bytes > budget || StorageTexture::AnyPendingOverlaps(importSpan))) {
         state.retireRefused = true;
         return nullptr;
     }
@@ -1802,6 +1803,10 @@ bool reattachTrimmed(const Context& context, HostImports& state, HostImport& ent
 // Drops imports whose registered range changed or disappeared: their pages may no longer back the
 // guest addresses. Walks the imports only when the registry changed since the last walk.
 void refreshImports(const Context& context, HostImports& state, const GuestAllocations::Lease& lease) {
+    if (!state.retireAllowed && (state.device != context.device || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration)) {
+        state.retireRefused = true;
+        return;
+    }
     if (state.device != context.device) {
 #ifdef _WIN32
         drainSettles(state);

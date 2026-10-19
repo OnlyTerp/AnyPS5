@@ -1649,8 +1649,12 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
     const auto preparedHandle = [&](const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
         std::vector<std::uint64_t> key;
         ShaderRecompiler::BuildPreparedShaderKey(request, key);
-        for (const auto& entry : transaction.Read(snapshot).entries) {
-            if (entry.codeOffset == codeOffset && ShaderRecompiler::MatchesPreparedShader(request, *entry.handle, key)) return entry.handle;
+        {
+            std::unique_lock lock(snapshot.prepared->mutex);
+            AwaitRegisteredPreparation(*snapshot.prepared, lock);
+            for (const auto& entry : snapshot.prepared->entries) {
+                if (entry.codeOffset == codeOffset && ShaderRecompiler::MatchesPreparedShader(request, *entry.handle, key)) return entry.handle;
+            }
         }
         PerformanceTimer timing("Shader.PrepareArtifact");
         return PrepareShaderWithDiagnostics(request);
@@ -1807,10 +1811,34 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
         transaction.Commit();
         return;
     }
+    if (LazyShaderPreparation()) {
+        for (const auto& selected : selectedStages) transaction.Edit(*selected).deferred = true;
+        transaction.Commit();
+        return;
+    }
     struct GraphicsAbiKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, GraphicsAbiKeyStorage>();
     BuildRegisteredAbiKey(state, *localDevice, key);
     const auto primitiveType = state.userConfig.find(0x242u);
+    const bool committedAbi = [&] {
+        std::unique_lock lock(owner->prepared->mutex);
+        AwaitRegisteredPreparation(*owner->prepared, lock);
+        return std::ranges::any_of(owner->prepared->graphicsAbis, [&](const auto& abi) { return abi.key == key && abi.registry.lock() == registry; });
+    }();
+    DrawDecode decoded{};
+    std::vector<PreparedGraphicsStage> prepared;
+    std::optional<std::string> decodeError;
+    const auto prepareStages = [&] {
+        try {
+            decoded.state.stages = Graphics::DecodeShaderStages(state, VertexWorkgroupRequired(state, *registry));
+            DecodeGraphicsPrograms(decoded, state, *registry, true, false);
+        } catch (const std::exception& error) {
+            decodeError = error.what();
+            return;
+        }
+        prepared = PrepareGraphicsStages(decoded, localDevice->Target(), true);
+    };
+    if (!committedAbi) prepareStages();
     for (const auto& abi : transaction.Read(*owner).graphicsAbis) {
         if (abi.key != key || abi.registry.lock() != registry) continue;
         for (const auto& stage : abi.stages) {
@@ -1821,16 +1849,12 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
         transaction.Commit();
         return;
     }
-    DrawDecode decoded{};
-    try {
-        decoded.state.stages = Graphics::DecodeShaderStages(state, VertexWorkgroupRequired(state, *registry));
-        DecodeGraphicsPrograms(decoded, state, *registry, true, false);
-    } catch (const std::exception& error) {
-        for (const auto& selected : selectedStages) DeferPipelineStage(transaction.Edit(*selected), *selected, error.what());
+    if (committedAbi) prepareStages();
+    if (decodeError) {
+        for (const auto& selected : selectedStages) DeferPipelineStage(transaction.Edit(*selected), *selected, decodeError->c_str());
         transaction.Commit();
         return;
     }
-    auto prepared = PrepareGraphicsStages(decoded, localDevice->Target(), true);
     for (auto& stage : prepared) {
         if (stage.entry.handle == nullptr) continue;
         const auto& entries = transaction.Read(*stage.snapshot).entries;
