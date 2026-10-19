@@ -24,6 +24,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -2373,22 +2374,40 @@ void ownPlanValues(IrResourcePlan& plan) {
         for (auto& dword : source.dwords) roots.push_back(&dword);
     }
     for (auto& read : plan.srtReads) roots.push_back(&read.value);
-    for (auto& block : plan.controlFlow) roots.push_back(&block.condition);
     for (auto& value : plan.uniformFill.values) roots.push_back(&value);
+    const auto closures = roots.size();
+    for (auto& block : plan.controlFlow) roots.push_back(&block.condition);
 
     std::unordered_map<const IrValue*, IrValue*> clones;
+    std::unordered_set<const IrValue*> closed;
+    std::unordered_set<const IrValue*> opened;
     std::vector<const IrValue*> order;
-    std::vector<const IrValue*> pending;
-    for (const auto* root : roots) {
-        if (*root != nullptr) pending.push_back(*root);
+    std::vector<std::pair<const IrValue*, bool>> pending;
+    for (std::size_t index = 0; index < roots.size(); ++index) {
+        if (*roots[index] != nullptr) pending.emplace_back(*roots[index], index < closures);
     }
     while (!pending.empty()) {
-        const auto* value = pending.back();
+        const auto [value, closure] = pending.back();
         pending.pop_back();
-        if (!clones.emplace(value, nullptr).second) continue;
-        order.push_back(value);
+        if (clones.emplace(value, nullptr).second) order.push_back(value);
+        const auto reads = closure ? Detail::EvaluatorReads::Closure : Detail::Evaluator::Reads(plan, *value);
+        if (reads == Detail::EvaluatorReads::Nothing || closed.contains(value)) continue;
+        if (closure) {
+            closed.insert(value);
+        } else if (!opened.insert(value).second) {
+            continue;
+        }
         for (const auto* argument : value->Arguments()) {
-            if (argument != nullptr) pending.push_back(argument);
+            if (argument != nullptr) pending.emplace_back(argument, closure);
+        }
+        if (!closure && reads == Detail::EvaluatorReads::Closure && value->ArgumentCount() != 0u && value->Argument(0) != nullptr) {
+            const auto* handle = value->Argument(0)->Resolve();
+            if (clones.emplace(handle, nullptr).second) order.push_back(handle);
+            if (opened.insert(handle).second) {
+                for (const auto* argument : handle->Arguments()) {
+                    if (argument != nullptr) pending.emplace_back(argument, false);
+                }
+            }
         }
     }
     plan.valueStorage.Reserve(order.size());
@@ -2409,6 +2428,7 @@ void ownPlanValues(IrResourcePlan& plan) {
         return clone;
     };
     for (const auto* value : order) {
+        if (!closed.contains(value) && !opened.contains(value)) continue;
         std::vector<IrValue*> arguments;
         std::vector<IrBlock*> phiBlocks;
         arguments.reserve(value->ArgumentCount());
@@ -2491,6 +2511,7 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
     plan.userDataBase = source.userDataBase;
     plan.userDataCount = source.userDataCount;
     plan.srgbDecodeFormats = source.srgbDecodeFormats;
+    plan.workgroupThreads = source.workgroupThreads;
     plan.memoryInfo = source.memoryInfo;
     plan.descriptorSources = source.descriptorSources;
     plan.controlFlow = source.controlFlow;

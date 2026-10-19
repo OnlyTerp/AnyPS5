@@ -362,6 +362,80 @@ std::optional<bool> evaluableAlone(const IrResourcePlan& program, const IrValue&
 }
 
 template<typename TNode>
+EvaluatorReads BasicEvaluator<TNode>::Reads(const IrResourcePlan& program, const IrValue& value) {
+    if (value.IsIdentity()) {
+        return EvaluatorReads::Arguments;
+    }
+    if (value.HasImmediate()) {
+        return EvaluatorReads::Nothing;
+    }
+    switch (value.Opcode()) {
+        case IrOpcode::LoadAddressU32:
+        case IrOpcode::ReadConstBuffer: return IsRawRead(program, value) ? EvaluatorReads::Closure : EvaluatorReads::Nothing;
+        case IrOpcode::CompositeConstructU32x2:
+        case IrOpcode::IAddCarry32:
+        case IrOpcode::GetUserData:
+        case IrOpcode::GetShaderBase:
+        case IrOpcode::Phi:
+        case IrOpcode::ReadFirstLane:
+        case IrOpcode::BitCastU32F32:
+        case IrOpcode::BitCastF32U32:
+        case IrOpcode::CompositeExtractU64:
+        case IrOpcode::CompositeExtractU32x2:
+        case IrOpcode::CompositeConstructU64:
+        case IrOpcode::ReadConst:
+        case IrOpcode::IAdd32:
+        case IrOpcode::IAdd64:
+        case IrOpcode::ISub32:
+        case IrOpcode::ISub64:
+        case IrOpcode::IMul32:
+        case IrOpcode::IMul64:
+        case IrOpcode::SMin32:
+        case IrOpcode::UMin32:
+        case IrOpcode::ConvertF32U32:
+        case IrOpcode::ConvertU32F32:
+        case IrOpcode::FPMul32:
+        case IrOpcode::FPTrunc32:
+        case IrOpcode::FPIsNan32:
+        case IrOpcode::FPOrdLessThanEqual32:
+        case IrOpcode::FPOrdGreaterThanEqual32:
+        case IrOpcode::BitwiseAnd32:
+        case IrOpcode::BitwiseAnd64:
+        case IrOpcode::BitwiseOr32:
+        case IrOpcode::BitwiseXor32:
+        case IrOpcode::BitwiseNot32:
+        case IrOpcode::ShiftLeftLogical32:
+        case IrOpcode::ShiftLeftLogical64:
+        case IrOpcode::ShiftRightLogical32:
+        case IrOpcode::ShiftRightLogical64:
+        case IrOpcode::ShiftRightArithmetic32:
+        case IrOpcode::ShiftRightArithmetic64:
+        case IrOpcode::BitFieldUExtract:
+        case IrOpcode::BitFieldSExtract:
+        case IrOpcode::BitFieldInsert:
+        case IrOpcode::SelectU32:
+        case IrOpcode::SelectU1:
+        case IrOpcode::SelectF32:
+        case IrOpcode::IEqual32:
+        case IrOpcode::INotEqual32:
+        case IrOpcode::SLessThan32:
+        case IrOpcode::ULessThan32:
+        case IrOpcode::UGreaterThan32:
+        case IrOpcode::LogicalAnd:
+        case IrOpcode::LogicalOr:
+        case IrOpcode::LogicalXor:
+        case IrOpcode::LogicalNot:
+        case IrOpcode::UndefU1:
+        case IrOpcode::UndefU8:
+        case IrOpcode::UndefU16:
+        case IrOpcode::UndefU32:
+        case IrOpcode::UndefU64:
+            return EvaluatorReads::Arguments;
+        default: return EvaluatorReads::Nothing;
+    }
+}
+
+template<typename TNode>
 bool BasicEvaluator<TNode>::MayEvaluate(const IrResourcePlan& program, IrValue* value, const IrValue* activeMask) {
     std::unordered_set<const IrValue*> firstLanes;
     return MayEvaluate(program, value, activeMask, firstLanes);
@@ -449,6 +523,9 @@ bool BasicEvaluator<TNode>::MayEvaluate(const IrResourcePlan& program, IrValue* 
 
 template<typename TNode>
 bool BasicEvaluator<TNode>::EvaluateInst(const TNode& inst, std::uint64_t& result) {
+    if (Reads(_program, *inst.Value()) == EvaluatorReads::Nothing) {
+        return false;
+    }
     std::uint64_t a = 0;
     std::uint64_t b = 0;
     std::uint64_t c = 0;

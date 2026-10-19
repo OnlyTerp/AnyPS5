@@ -1615,6 +1615,7 @@ IrResourcePlan handBuiltPlan() {
     plan.userDataBase = 2u;
     plan.userDataCount = 4u;
     plan.srgbDecodeFormats = 5u;
+    plan.workgroupThreads = {64u, 2u, 3u};
     MemoryInfo memory;
     memory.kind = ResourceKind::Image;
     memory.resource = 1u;
@@ -1743,7 +1744,7 @@ bool samePlan(const IrResourcePlan& left, const IrResourcePlan& right) {
             if (!sameBlock(a.PhiBlock(operand), b.PhiBlock(operand))) return false;
         }
     }
-    if (left.stage != right.stage || left.shaderHash != right.shaderHash || left.userDataBase != right.userDataBase || left.userDataCount != right.userDataCount || left.srgbDecodeFormats != right.srgbDecodeFormats) return false;
+    if (left.stage != right.stage || left.shaderHash != right.shaderHash || left.userDataBase != right.userDataBase || left.userDataCount != right.userDataCount || left.srgbDecodeFormats != right.srgbDecodeFormats || left.workgroupThreads != right.workgroupThreads) return false;
     if (left.memoryInfo != right.memoryInfo || left.descriptorSources.size() != right.descriptorSources.size() || left.controlFlow.size() != right.controlFlow.size() || left.srtReads.size() != right.srtReads.size()) return false;
     for (std::size_t index = 0; index < left.descriptorSources.size(); ++index) {
         const auto& a = left.descriptorSources[index];

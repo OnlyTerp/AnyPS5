@@ -105,7 +105,7 @@ static_assert(sizeof(IrDescriptorBinding) == 32, "IrDescriptorBinding changed: u
 static_assert(sizeof(BindingAllocationResult) == 192, "BindingAllocationResult changed: update the allocation encoder");
 static_assert(sizeof(CompiledBindingLayout) == 96, "CompiledBindingLayout changed: update the allocation encoder");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
-static_assert(sizeof(IrResourcePlan) == 760, "IrResourcePlan changed: update EncodePlan and DecodePlan");
+static_assert(sizeof(IrResourcePlan) == 736, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(sizeof(IrValue) == 152, "IrValue changed: update the plan value encoder");
 static_assert(sizeof(GuestRegister) == 8, "GuestRegister changed: update the plan value encoder");
 static_assert(sizeof(MemoryInfo) == 80, "MemoryInfo changed: update the plan encoder");
@@ -148,7 +148,7 @@ static_assert(fieldCount<DeviceImageUse>() == 4, "DeviceImageUse changed: update
 static_assert(sizeof(DeviceImageTableAbi::Expectation) == 76 && fieldCount<DeviceImageTableAbi::Expectation>() == 5, "DeviceImageTableAbi::Expectation changed: update the invocation encoder");
 static_assert(fieldCount<StageInput>() == 5, "StageInput changed: update the info encoder");
 static_assert(fieldCount<StageOutput>() == 4, "StageOutput changed: update the info encoder");
-static_assert(fieldCount<IrResourcePlan>() == 26, "IrResourcePlan changed: update EncodePlan and DecodePlan");
+static_assert(fieldCount<IrResourcePlan>() == 25, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
 static_assert(fieldCount<MemoryInfo>() == 31, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 3, "DescriptorSource changed: update the plan encoder");
@@ -1064,6 +1064,7 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
     writer.Value(plan.userDataBase);
     writer.Value(plan.userDataCount);
     writer.Value(plan.srgbDecodeFormats);
+    for (const auto threads : plan.workgroupThreads) writer.Value(threads);
     writer.List(plan.blockStorage, [](Writer& out, const std::unique_ptr<IrBlock>& block) { out.Value(block->Id()); });
     writer.Value<std::uint64_t>(plan.valueStorage.Size());
     for (const auto& stored : plan.valueStorage) {
@@ -1173,6 +1174,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
     reader.Value(plan.userDataBase);
     reader.Value(plan.userDataCount);
     reader.Value(plan.srgbDecodeFormats);
+    for (auto& threads : plan.workgroupThreads) reader.Value(threads);
     std::vector<std::uint32_t> blockIds;
     reader.Values(blockIds);
     std::vector<PlanValueRecord> records;
@@ -1247,6 +1249,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         std::vector<IrValue*> arguments;
         std::vector<IrBlock*> phiBlocks;
         arguments.reserve(record.arguments.size());
+        if (value.IsPhi()) phiBlocks.reserve(record.arguments.size());
         for (std::size_t operand = 0; operand < record.arguments.size(); ++operand) {
             arguments.push_back(valueAt(record.arguments[operand]));
             if (value.IsPhi()) phiBlocks.push_back(plan.blockStorage[record.phiBlocks[operand]].get());
