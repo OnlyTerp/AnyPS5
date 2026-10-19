@@ -133,15 +133,33 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if (bump) bumpEpoch(&EpochBumps::waits);
         }
     } epochPoint;
+    const auto orderAfter = [&](bool label) {
+        if (requireMemory) return;
+        const auto localDevice = device.Load();
+        if (localDevice == nullptr || !localDevice->SeparateQueues()) return;
+        if (!label && !Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes)) return;
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (label) localDevice->OrderAfterLabel(awaited, awaitedBytes);
+        else localDevice->OrderAfterValue(awaited, awaitedBytes);
+    };
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
     if (Pm4::WaitSatisfiedUnchecked(packet)) {
         ++outcomes.atEntry;
+        orderAfter(false);
         return;
     }
-    if (heldAtSubmit) return;
+    if (heldAtSubmit) {
+        orderAfter(false);
+        return;
+    }
     if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
-        if (writer != queue) notePendingWait(packet, queue, received);
-        else epochPoint.bump = false;
+        if (writer != queue) {
+            notePendingWait(packet, queue, received);
+            orderAfter(true);
+        } else {
+            epochPoint.bump = false;
+        }
         return;
     }
 
@@ -185,6 +203,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if (!hit->late) epochPoint.bump = false;
         } else {
             notePendingWait(packet, queue, received);
+            orderAfter(true);
         }
         return true;
     };
@@ -334,8 +353,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     StallWatch stall(queue);
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
         if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
-            if (writer != queue) notePendingWait(packet, queue, received);
-            else epochPoint.bump = false;
+            if (writer != queue) {
+                notePendingWait(packet, queue, received);
+                orderAfter(true);
+            } else {
+                epochPoint.bump = false;
+            }
             return;
         }
         ++polls;
@@ -401,6 +424,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     }
     ++outcomes.polled;
+    orderAfter(false);
 }
 
 }
