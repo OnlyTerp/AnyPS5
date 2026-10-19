@@ -4501,6 +4501,9 @@ struct MockVulkan {
     std::map<VkPipelineLayout, VkPipelineLayoutCreateFlags> pipelineLayoutFlags;
     std::map<VkPipelineLayout, std::vector<VkPushConstantRange>> pipelineLayoutPushRanges;
     std::map<VkGraphicsPipelineLibraryFlagsEXT, VkPipelineLayout> libraryLayouts;
+    std::map<VkGraphicsPipelineLibraryFlagsEXT, std::uint32_t> libraryCreates;
+    std::uint32_t linkCreates = 0;
+    std::function<void(VkGraphicsPipelineLibraryFlagsEXT)> libraryHook;
     std::uint32_t pipelineCreateCount = 0;
     std::vector<std::array<std::uint32_t, 3>> pipelineSpecializations;
     VkPipeline boundPipeline = VK_NULL_HANDLE;
@@ -4724,19 +4727,18 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreatePipelineLayout(VkDevice, const VkPipeli
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockCreateGraphicsPipelines(VkDevice, VkPipelineCache, std::uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks*, VkPipeline* pipelines) {
-    {
-        std::unique_lock lock(pipelineCreateMutex);
-        if (blockLibraryCreate) {
-            libraryCreateEntered = true;
-            pipelineCreateCondition.notify_all();
-            pipelineCreateCondition.wait(lock, [] { return releaseLibraryCreate; });
-        }
+    std::unique_lock guard(pipelineCreateMutex);
+    if (blockLibraryCreate) {
+        libraryCreateEntered = true;
+        pipelineCreateCondition.notify_all();
+        pipelineCreateCondition.wait(guard, [] { return releaseLibraryCreate; });
     }
     Require(count == 1, "mock expects exactly one graphics pipeline per call");
     if ((infos[0].flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) == 0) {
         const auto* linked = static_cast<const VkPipelineLibraryCreateInfoKHR*>(infos[0].pNext);
         Require(linked != nullptr && linked->sType == VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR && linked->libraryCount != 0, "mock expects a graphics pipeline library or a pipeline linked from libraries");
         *pipelines = makeHandle<VkPipeline>();
+        ++mock.linkCreates;
         ++mock.pipelineCreateCount;
         ++mock.live;
         return VK_SUCCESS;
@@ -4744,8 +4746,12 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateGraphicsPipelines(VkDevice, VkPipelineC
     const auto* library = static_cast<const VkGraphicsPipelineLibraryCreateInfoEXT*>(infos[0].pNext);
     Require(library != nullptr && library->sType == VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, "missing graphics pipeline library description");
     mock.libraryLayouts[library->flags] = infos[0].layout;
+    ++mock.libraryCreates[library->flags];
     *pipelines = makeHandle<VkPipeline>();
     ++mock.live;
+    const auto hook = mock.libraryHook;
+    guard.unlock();
+    if (hook) hook(library->flags);
     return VK_SUCCESS;
 }
 
@@ -6964,12 +6970,156 @@ void pipelineLibraryClearWaitsForBuildTests() {
     Require(mock.live == 0, "clearing during a library build leaked Vulkan objects");
 }
 
+void pipelineLibraryConcurrencyTests() {
 void framebufferOwnerTests() {
     using namespace AgcDriver::Graphics;
     mock = MockVulkan{};
     auto context = mockContext();
     context.graphicsPipelineLibrary = true;
     context.pipelineLinkTimeOptimization = false;
+    const std::array<VkPipelineShaderStageCreateInfo, 2> stages{{
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, makeHandle<VkShaderModule>(), "main", nullptr},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, makeHandle<VkShaderModule>(), "main", nullptr},
+    }};
+    const auto dynamicStates = PipelineLibraryDynamicStates();
+    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size());
+    dynamic.pDynamicStates = dynamicStates.data();
+    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    info.stageCount = static_cast<std::uint32_t>(stages.size());
+    info.pStages = stages.data();
+    info.pDynamicState = &dynamic;
+    const VkPipelineRenderingCreateInfoKHR rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
+    const VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    const auto keys = [](std::uint8_t fragment) {
+        PipelineLibraryKeys result;
+        result.fragmentShader = {std::byte{fragment}};
+        result.layout = {std::byte{1}};
+        return result;
+    };
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool blocked = false;
+    bool release = false;
+    bool armed = true;
+    mock.libraryHook = [&](VkGraphicsPipelineLibraryFlagsEXT flags) {
+        if (flags != VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) return;
+        std::unique_lock lock(mutex);
+        if (!armed) return;
+        armed = false;
+        blocked = true;
+        changed.notify_all();
+        changed.wait(lock, [&] { return release; });
+    };
+    std::array<VkPipeline, 3> pipelines{};
+    std::thread first([&] { pipelines[0] = LinkPipelineFromLibraries(context, info, rendering, layout, keys(1)); });
+    {
+        std::unique_lock lock(mutex);
+        Require(changed.wait_for(lock, std::chrono::seconds(10), [&] { return blocked; }), "the first graphics library creation never started");
+    }
+    bool secondDone = false;
+    std::thread second([&] {
+        pipelines[1] = LinkPipelineFromLibraries(context, info, rendering, layout, keys(2));
+        std::lock_guard lock(mutex);
+        secondDone = true;
+        changed.notify_all();
+    });
+    bool overlapped = false;
+    {
+        std::unique_lock lock(mutex);
+        overlapped = changed.wait_for(lock, std::chrono::seconds(2), [&] { return secondDone; });
+    }
+    std::thread third([&] { pipelines[2] = LinkPipelineFromLibraries(context, info, rendering, layout, keys(1)); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    changed.notify_all();
+    first.join();
+    second.join();
+    third.join();
+    mock.libraryHook = nullptr;
+    Require(overlapped, "a graphics library creation waited for another library's creation to finish");
+    Require(mock.libraryCreates.at(VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) == 2u, "two draws that needed one new fragment library created it " + std::to_string(mock.libraryCreates.at(VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) - 1u) + " times");
+    Require(mock.linkCreates == 3u && pipelines[0] != VK_NULL_HANDLE && pipelines[1] != VK_NULL_HANDLE && pipelines[2] != VK_NULL_HANDLE, "a draw did not get its linked pipeline");
+    for (const auto pipeline : pipelines) mockDestroyPipeline(context.device, pipeline, nullptr);
+    ClearPipelineLibraries(context.device);
+    Require(mock.live == 0, "graphics library concurrency tests leaked Vulkan objects");
+}
+
+void cachedPipelineConcurrencyTests() {
+    using namespace AgcDriver::Graphics;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.graphicsPipelineLibrary = true;
+    context.pipelineLinkTimeOptimization = false;
+    context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    const State state{};
+    ShaderRecompiler::RecompileResult vertex, cachedFragment, newFragment;
+    vertex.spirv = makeModule({});
+    cachedFragment.spirv = makeModule({.fragment = true});
+    newFragment.spirv = makeModule({.fragment = true, .terminateInvocation = true});
+    vertex.variantId = 1;
+    cachedFragment.variantId = 2;
+    newFragment.variantId = 3;
+    const std::array<CompiledShader, 2> cached{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &cachedFragment, PipelinePushSlotBytes}}};
+    const std::array<CompiledShader, 2> created{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &newFragment, PipelinePushSlotBytes}}};
+    std::array<std::uint32_t, 1> mainKey{11}, fragmentKey{22};
+    const PipelineSetLayouts resources{makeHandle<VkDescriptorSetLayout>(), makeHandle<VkDescriptorSetLayout>(), true, mainKey, fragmentKey};
+    auto resident = CachedPipeline(context, state, VertexInputLayout{}, resources, cached, VK_IMAGE_LAYOUT_GENERAL);
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool blocked = false;
+    bool release = false;
+    bool armed = true;
+    mock.libraryHook = [&](VkGraphicsPipelineLibraryFlagsEXT flags) {
+        if (flags != VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) return;
+        std::unique_lock lock(mutex);
+        if (!armed) return;
+        armed = false;
+        blocked = true;
+        changed.notify_all();
+        changed.wait(lock, [&] { return release; });
+    };
+    std::shared_ptr<Pipeline> first, second;
+    std::thread creating([&] { first = CachedPipeline(context, state, VertexInputLayout{}, resources, created, VK_IMAGE_LAYOUT_GENERAL); });
+    {
+        std::unique_lock lock(mutex);
+        Require(changed.wait_for(lock, std::chrono::seconds(10), [&] { return blocked; }), "the first graphics pipeline creation never started");
+    }
+    bool found = false;
+    std::shared_ptr<Pipeline> hit;
+    std::thread looking([&] {
+        hit = CachedPipeline(context, state, VertexInputLayout{}, resources, cached, VK_IMAGE_LAYOUT_GENERAL);
+        std::lock_guard lock(mutex);
+        found = true;
+        changed.notify_all();
+    });
+    bool overlapped = false;
+    {
+        std::unique_lock lock(mutex);
+        overlapped = changed.wait_for(lock, std::chrono::seconds(2), [&] { return found; });
+    }
+    std::thread waiting([&] { second = CachedPipeline(context, state, VertexInputLayout{}, resources, created, VK_IMAGE_LAYOUT_GENERAL); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    changed.notify_all();
+    creating.join();
+    looking.join();
+    waiting.join();
+    mock.libraryHook = nullptr;
+    Require(overlapped && hit == resident, "a draw whose pipeline was cached waited for another pipeline's creation");
+    Require(first != nullptr && second == first && mock.linkCreates == 2u, "two draws that needed one new pipeline created it " + std::to_string(mock.linkCreates - 1u) + " times");
+    resident.reset();
+    hit.reset();
+    first.reset();
+    second.reset();
+    ClearCachedPipelines(context.device);
+    Require(mock.live == 0, "cached pipeline concurrency tests leaked Vulkan objects");
     context.limits.maxColorAttachments = 1;
     context.limits.maxFramebufferWidth = 4;
     context.limits.maxFramebufferHeight = 4;
@@ -10148,6 +10298,8 @@ int main(int argc, char** argv) {
         retainedPixelStageTests();
         pipelineLibrarySetTests();
         pipelineLibraryClearWaitsForBuildTests();
+        pipelineLibraryConcurrencyTests();
+        cachedPipelineConcurrencyTests();
         framebufferOwnerTests();
         hdrComponentSwapTests();
         depthMaintenanceTests();

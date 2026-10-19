@@ -54,6 +54,8 @@ inline VkDeviceSize HostImportOffset(const HostImport& import, std::uint64_t add
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };
 
+void RetainRetiredImport(std::shared_ptr<void> holder);
+
 struct ImportProbe {
     const char* failure = nullptr;
     VkResult result = VK_SUCCESS;
@@ -237,6 +239,7 @@ public:
     explicit GuestBufferMemory(const Context& context);
     ~GuestBufferMemory();
     void AcquireRegistered();
+    static void Prewarm(const Context& context);
     // APS5_PROFILE_DRAW: the parts of one address-based build ([address] line every 10 s): the
     // registry lease, the imports pass, the mirror preparation and the mirror compare (blocks and
     // copied blocks) are timed by AcquireRegistered on the calling thread; the caller adds the
@@ -456,6 +459,7 @@ private:
     // holds only the regions outside it (V#s, snapshots, ranges copied per build).
     std::shared_ptr<const AddressSpace> space;
     std::weak_ptr<const AddressSpace> releasedSpace;
+    std::shared_ptr<const void> retiredSince;
     mutable std::uint64_t tableSerial = 0;
     mutable std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> tableRanges;
     // Import registry epoch when `direct` pointers were taken at acquire time; they are reused while

@@ -340,6 +340,9 @@ public:
     void EnqueueDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {});
     bool PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders);
     Graphics::Context GraphicsContext() const { return graphicsContext(); }
+    bool PrepareDrawPipelines(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders);
+    std::uint64_t PresyncDraw(const Graphics::State& graphics);
+    void PrewarmAddressSpace();
 
 public:
     // The device's Graphics::Context: a copy of the one built at setup (its instance functions

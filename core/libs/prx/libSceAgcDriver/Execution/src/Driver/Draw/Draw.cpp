@@ -893,7 +893,11 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     const auto lockForDraw = [&] {
         require(tail.queue != nullptr, "the draw finisher reached a draw it cannot commit through the pipeline");
         if (gpuLock.owns_lock()) return;
+        if (!drawHit) static_cast<void>(localDevice->PrepareDrawPipelines(graphics, stages));
+        localDevice->PrewarmAddressSpace();
         phaseTiming.Phase(DrawRowVectors);
+        const auto* presyncDevice = localDevice.get();
+        const auto presynced = localDevice->PresyncDraw(graphics);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         gpuLock.lock();
         timing.Mark("gpu_mutex_wait");
@@ -904,6 +908,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             std::fprintf(stderr, "[draw] device replaced during unlocked preparation (%llu)\n", static_cast<unsigned long long>(++replaced));
             localDevice = std::move(current);
         }
+        if (presynced != 0 && localDevice.get() == presyncDevice) localDevice->ReapRecorded(presynced);
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(DrawRowLabels);
@@ -1028,6 +1033,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         }
     }
     if (pipelined && !drawParameters.indirect && (tail.queue == nullptr || deferredLabels().labels.empty())) {
+        if (!gpuLock.owns_lock() && !drawHit) static_cast<void>(localDevice->PrepareDrawPipelines(graphics, stages));
         phaseTiming.Phase(DrawRowVectors);
         auto writes = drawWriteRanges(graphics, stages);
         const auto commitQueue = submission.queue;

@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <future>
 #include <list>
 #include <mutex>
 #include <string_view>
@@ -628,6 +629,10 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
 
 bool Pipeline::Prebuild(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
     if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return !shader.program->stencilReferences.empty(); })) return false;
+    PipelineLibraryKeys keys;
+    if (!libraryKeys(keys, context, state, vertexInput, resources, shaders)) return false;
+    const auto depthFormat = state.depth ? HostDepthFormat(context, state.depth->format) : VK_FORMAT_UNDEFINED;
+    if (PipelineLibraryShadersBuilt(context, keys, depthFormat, state.depth && HasStencil(state.depth->format) ? depthFormat : VK_FORMAT_UNDEFINED)) return true;
     struct Scope {
         Scope() { prebuilding = true; prebuilt = false; }
         ~Scope() { prebuilding = false; }
@@ -981,10 +986,15 @@ struct PipelineStore {
         std::vector<std::byte> key;
         std::shared_ptr<Pipeline> pipeline;
     };
+    struct Building {
+        std::vector<std::byte> key;
+        std::shared_future<std::shared_ptr<Pipeline>> pipeline;
+    };
     std::mutex mutex;
     // Least recently used first.
     std::list<Entry> entries;
     std::unordered_map<std::uint64_t, std::list<Entry>::iterator> index;
+    std::unordered_map<std::uint64_t, Building> building;
     std::uint64_t hits = 0;
     std::uint64_t misses = 0;
     std::uint64_t uncached = 0;
@@ -1076,6 +1086,9 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         abandon(store, it);
         return nullptr;
     };
+    std::shared_future<std::shared_ptr<Pipeline>> other;
+    std::promise<std::shared_ptr<Pipeline>> building;
+    bool shared = true;
     {
         std::lock_guard lock(store.mutex);
         reportPipelines(store);
@@ -1086,46 +1099,68 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             return pipeline;
         }
         if (collision) {
-            // A different configuration with the same hash keeps the resident entry; this one stays private.
             ++store.uncached;
             ++store.totals.uncached;
-            return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+            shared = false;
+        } else if (const auto pending = store.building.find(hash); pending != store.building.end()) {
+            if (pending->second.key == key) {
+                other = pending->second.pipeline;
+            } else {
+                ++store.uncached;
+                ++store.totals.uncached;
+                shared = false;
+            }
+        } else {
+            ++store.misses;
+            ++store.totals.misses;
+            store.building.emplace(hash, PipelineStore::Building{key, building.get_future().share()});
         }
-        ++store.misses;
-        ++store.totals.misses;
     }
-    // Built outside the mutex: a draw that finds its pipeline resident is not held behind another
-    // thread's build (the journal replay builds here too), and a device's driver compiles in
-    // parallel when several threads build at once.
-    auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+    if (!shared) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+    if (other.valid()) return other.get();
+    const auto ownKey = key;
+    std::shared_ptr<Pipeline> pipeline;
+    try {
+        pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+    } catch (...) {
+        {
+            std::lock_guard lock(store.mutex);
+            store.building.erase(hash);
+        }
+        building.set_exception(std::current_exception());
+        throw;
+    }
     const auto bound = storeBound();
     const bool replaying = PipelineJournalReplaying();
     {
         std::lock_guard lock(store.mutex);
+        store.building.erase(hash);
         bool collision = false;
-        if (auto raced = lookup(collision)) return raced;
+        if (auto raced = lookup(collision)) {
+            building.set_value(raced);
+            return raced;
+        }
         if (collision) {
             ++store.uncached;
             ++store.totals.uncached;
+            building.set_value(pipeline);
             return pipeline;
         }
-        // Entries of another device belong to one the driver replaced (it does so under the GpuMutex
-        // before any draw reaches the new device), whose objects went with it: forget them.
         for (auto it = store.entries.begin(); it != store.entries.end();) {
             it = alive(*it, context) ? std::next(it) : abandon(store, it);
         }
-        // A replayed pipeline enters at the least recently used end and never displaces a draw's:
-        // the title's own pipelines evict it first, and a full store takes none.
-        if (replaying && store.entries.size() >= bound) return pipeline;
+        if (replaying && store.entries.size() >= bound) {
+            building.set_value(pipeline);
+            return pipeline;
+        }
         if (replaying) {
-            store.entries.push_front({context.device, context.bufferPool, context.bufferPool != nullptr, hash, std::vector<std::byte>(key), pipeline});
+            store.entries.push_front({context.device, context.bufferPool, context.bufferPool != nullptr, hash, ownKey, pipeline});
             store.index[hash] = store.entries.begin();
         } else {
-            store.entries.push_back({context.device, context.bufferPool, context.bufferPool != nullptr, hash, std::vector<std::byte>(key), pipeline});
+            store.entries.push_back({context.device, context.bufferPool, context.bufferPool != nullptr, hash, ownKey, pipeline});
             store.index[hash] = std::prev(store.entries.end());
         }
         while (store.entries.size() > bound) {
-            // Only an entry no recorded draw still holds may go (Kept keeps its shared_ptr until the fence).
             const auto victim = std::find_if(store.entries.begin(), store.entries.end(), [](const PipelineStore::Entry& entry) { return entry.pipeline.use_count() == 1; });
             if (victim == store.entries.end()) break;
             store.index.erase(victim->hash);
@@ -1134,6 +1169,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             ++store.totals.evicted;
         }
     }
+    building.set_value(pipeline);
     if (created != nullptr) *created = true;
     if (PipelineJournalEnabled() && !PipelineJournalReplaying()) RecordGraphicsPipeline(MakeGraphicsPipelineRecipe(state, vertexInput, resources, shaders, attachmentLayout), shaders);
     return pipeline;

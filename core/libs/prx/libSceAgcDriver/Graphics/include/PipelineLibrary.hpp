@@ -53,11 +53,14 @@ unsigned PipelineLibraryWorkers();
 
 struct PipelineLibraryCounters {
     std::array<std::uint64_t, 4> built{};
+    std::array<std::uint64_t, 4> builtUnderLock{};
     std::uint64_t linked = 0;
     std::uint64_t optimized = 0;
 };
 
 PipelineLibraryCounters PipelineLibraryCountersOf(VkDevice device);
+
+bool PipelineLibraryShadersBuilt(const Context& context, const PipelineLibraryKeys& keys, VkFormat depthFormat, VkFormat stencilFormat);
 
 }
 
