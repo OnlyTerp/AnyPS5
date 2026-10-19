@@ -127,6 +127,18 @@ enum class RasterPrimitive : std::uint8_t {
     Rectangle
 };
 
+enum class PixelPositionLocation : std::uint8_t {
+    Center,
+    Centroid,
+    Sample,
+    UpperLeft
+};
+
+constexpr float SampleLocationOffset(std::uint8_t location, std::uint32_t axis) {
+    const auto nibble = (static_cast<std::uint32_t>(location) >> (4u * axis)) & 0xfu;
+    return static_cast<float>(static_cast<std::int32_t>(nibble & 7u) - static_cast<std::int32_t>(nibble & 8u)) / 16.0f;
+}
+
 namespace ReversedBlendCode {
 
 inline constexpr std::uint32_t Enable = 1u;
@@ -178,6 +190,9 @@ struct ShaderPixelStageInfo {
     std::uint8_t quadPixelMask = 0xf;
     std::array<std::uint16_t, 4> quadSampleMask{0xffffu, 0xffffu, 0xffffu, 0xffffu};
     std::uint32_t reversedBlend = 0;
+    bool iteratesSamples = false;
+    PixelPositionLocation positionLocation = PixelPositionLocation::Center;
+    std::array<std::uint8_t, 32> sampleLocations{};
 };
 
 struct ShaderVertexBufferResource {
@@ -200,6 +215,7 @@ struct ShaderVertexStageInfo {
     std::uint32_t fetchBufferReg;
     bool fetchEmbedded;
     std::uint32_t paClVsOutCntl = 0;
+    std::uint32_t depthRemapMode = 0;
 };
 
 struct ShaderFloatMode {
@@ -226,6 +242,7 @@ struct GuestContext {
     std::span<const MemoryRegion> memory;
     std::optional<ShaderFloatMode> floatMode;
     std::span<const std::uint32_t> linkedCallFallbacks;
+    bool convertedSamples = false;
 };
 
 struct MeshTargetLimits {
@@ -278,6 +295,8 @@ struct SpirvTarget {
     bool gpuConstants = false;
     bool gpuConstantsVerify = false;
     bool deviceImageTables = false;
+    bool depthRangeRemap = false;
+    bool float32FlushToZero = false;
 };
 
 struct BindingLayout {
@@ -334,6 +353,8 @@ inline constexpr std::uint32_t MeshDrawPushOffsetBytes = 104;
 inline constexpr std::uint32_t MeshDrawPushBytes = 24;
 inline constexpr std::uint32_t TessellationLevelPushOffsetBytes = 120;
 inline constexpr std::uint32_t TessellationLevelPushBytes = 8;
+inline constexpr std::uint32_t DepthRemapPushOffsetBytes = 104;
+inline constexpr std::uint32_t DepthRemapPushBytes = 8;
 inline constexpr std::uint32_t MeshArgumentAddressDword = 4;
 inline constexpr std::uint32_t MeshArgumentIndexCountDword = 3;
 inline constexpr std::uint32_t MeshArgumentFirstIndexDword = 4;
@@ -399,7 +420,8 @@ enum class DescriptorImageShape {
     ImageCube,
     Image3D,
     Image1DArray,
-    Image2DMultisample
+    Image2DMultisample,
+    Image2DMultisampleArray
 };
 
 enum class DescriptorRole {
@@ -445,10 +467,12 @@ struct DescriptorBinding {
     std::vector<bool> bufferWritten;
     std::vector<bool> samplerUnnormalized;
     std::vector<bool> samplerIntegerBorder;
+    std::vector<bool> samplerCoordinatesIgnored;
     std::vector<bool> imageUnnormalized;
     std::vector<bool> imageUnnormalizedBaseLevel;
     std::vector<std::uint32_t> imageSamplers;
     std::vector<bool> bufferRead;
+    std::vector<std::uint32_t> bufferExtent;
 };
 
 struct ImageTableEntryPoison {
@@ -643,6 +667,7 @@ struct ShaderInvocation {
     std::uint64_t specializationId = 0;
     std::vector<DescriptorBinding> bindings;
     std::vector<std::byte> pushConstants;
+    bool readsDepthRemapPush = false;
     std::vector<VertexAttribute> vertexAttributes;
     std::uint64_t userDataRegisterReads = 0;
     std::uint32_t poisonedSrtReads = 0;

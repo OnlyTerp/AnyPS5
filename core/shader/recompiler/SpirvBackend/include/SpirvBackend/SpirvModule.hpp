@@ -62,6 +62,7 @@ public:
     [[nodiscard]] std::size_t AnnotationWordCount() const;
     [[nodiscard]] std::vector<std::uint32_t> TakeAnnotationWords(std::size_t offset);
     void AppendAnnotationWords(std::span<const std::uint32_t> words);
+    void AddSubgroupBallot(std::uint32_t type, std::uint32_t result, std::uint32_t scope, std::uint32_t predicate);
     void BeginHelperFunction();
     [[nodiscard]] bool InHelperFunction() const { return inHelperFunction; }
     void EndHelperFunction();
@@ -265,6 +266,12 @@ private:
     std::vector<std::uint32_t> globalVariables;
     std::vector<std::uint32_t> functionInstructions;
     std::vector<std::uint32_t> helperFunctionInstructions;
+    struct BlockBallots {
+        std::map<std::array<std::uint32_t, 3>, std::uint32_t> results;
+        std::size_t scanned = 0;
+    };
+    BlockBallots ballots;
+    BlockBallots helperBallots;
     bool inHelperFunction = false;
 };
 

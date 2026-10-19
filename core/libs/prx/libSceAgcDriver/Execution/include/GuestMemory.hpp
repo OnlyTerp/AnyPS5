@@ -103,6 +103,7 @@ void BumpCollectEpoch();
 std::uint64_t ProofSerial();
 void BreakProofs();
 void MarkProofThread();
+void AdoptLatestCollectEpoch();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
 std::uint64_t ThreadCollectEpoch();
