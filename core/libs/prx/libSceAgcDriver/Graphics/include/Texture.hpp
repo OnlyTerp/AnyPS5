@@ -198,6 +198,7 @@ public:
     // Deferred write-back (APS5_EAGER_WRITEBACK=1 stores at once instead).
     void MarkDirty();
     void MarkSliceDirty(std::uint32_t slice);
+    void MarkDirtyRegion(std::uint32_t mip, std::uint32_t depthSlice, std::uint32_t depthSlices, std::uint32_t arraySlice, VkRect2D area);
     void Flush();
     bool Dirty() const;
     // Stores every pending image overlapping the range, except `except`; returns whether any was.
@@ -363,6 +364,10 @@ public:
     bool Refresh();
     static std::uint64_t SinglePassMoves();
     static std::uint64_t SlabRetiles();
+    static std::uint64_t PartialUploads();
+    static std::uint64_t PartialUploadBytes();
+    static std::uint64_t PartialWriteBacks();
+    static std::uint64_t PartialWriteBackBytes();
     static std::uint64_t RefreshesProved();
     static std::uint64_t UntrackedCompares();
     std::uint64_t GuestBytes() const;
@@ -376,7 +381,8 @@ private:
     std::vector<VkBufferImageCopy> CopyRegions(const std::vector<bool>* layers = nullptr) const;
     // Uploads the surface, or only the tracked layers `layers` selects (the direct path; the others
     // upload everything).
-    void upload(const std::vector<bool>* layers = nullptr);
+    void upload(const std::vector<bool>* layers = nullptr, const std::vector<std::uint8_t>* blocks = nullptr);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> stampedRuns(const std::vector<std::uint8_t>& blocks) const;
     void captureGuestBytes(const std::vector<bool>* layers);
     bool originalHolds(std::uint64_t address, std::size_t bytes) const;
     bool compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize = false) const;
@@ -478,6 +484,8 @@ private:
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
     // registration; APS5_EAGER_WRITEBACK=1 stores at once instead).
     void markLayersPending(std::uint32_t first, std::uint32_t count);
+    void markUnitsPending(std::span<const std::pair<std::uint32_t, std::uint32_t>> runs);
+    std::optional<std::vector<std::pair<std::uint32_t, std::uint32_t>>> regionUnits(std::uint32_t level, std::uint32_t firstLayer, std::uint32_t layers, VkRect2D area) const;
     // Registers or unregisters the image as its pending layers say (after a write-back).
     void reconcilePending();
     // Pending images whose surface shares one of the 64 KiB write-stamp blocks firstBlock..lastBlock

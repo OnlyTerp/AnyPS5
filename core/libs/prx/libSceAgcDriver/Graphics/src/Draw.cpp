@@ -18,6 +18,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
+#include <cmath>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1544,6 +1545,37 @@ std::function<void()> indirectRecordCheck(const IndirectRecord* indirect) {
     };
 }
 
+struct TargetWrite {
+    std::uint32_t mip = 0;
+    std::uint32_t depthSlice = 0;
+    std::uint32_t depthSlices = 1;
+    std::uint32_t arraySlice = 0;
+    VkRect2D area{};
+    bool whole = true;
+};
+
+TargetWrite targetWrite(const State& state, const ColorTarget& color, bool multisampled) {
+    TargetWrite write{color.mip, color.depthSlice, color.layers, color.arraySlice, {}, multisampled};
+    std::int64_t x0 = 0;
+    std::int64_t y0 = 0;
+    std::int64_t x1 = std::min(state.renderExtent.width, color.extent.width);
+    std::int64_t y1 = std::min(state.renderExtent.height, color.extent.height);
+    x0 = std::max<std::int64_t>(x0, state.scissor.offset.x);
+    y0 = std::max<std::int64_t>(y0, state.scissor.offset.y);
+    x1 = std::min<std::int64_t>(x1, static_cast<std::int64_t>(state.scissor.offset.x) + state.scissor.extent.width);
+    y1 = std::min<std::int64_t>(y1, static_cast<std::int64_t>(state.scissor.offset.y) + state.scissor.extent.height);
+    const bool triangles = state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+    if (triangles) {
+        const auto& viewport = state.viewport;
+        x0 = std::max<std::int64_t>(x0, static_cast<std::int64_t>(std::floor(std::min(viewport.x, viewport.x + viewport.width))));
+        y0 = std::max<std::int64_t>(y0, static_cast<std::int64_t>(std::floor(std::min(viewport.y, viewport.y + viewport.height))));
+        x1 = std::min<std::int64_t>(x1, static_cast<std::int64_t>(std::ceil(std::max(viewport.x, viewport.x + viewport.width))));
+        y1 = std::min<std::int64_t>(y1, static_cast<std::int64_t>(std::ceil(std::max(viewport.y, viewport.y + viewport.height))));
+    }
+    if (x1 > x0 && y1 > y0) write.area = {{static_cast<std::int32_t>(x0), static_cast<std::int32_t>(y0)}, {static_cast<std::uint32_t>(x1 - x0), static_cast<std::uint32_t>(y1 - y0)}};
+    return write;
+}
+
 // Everything a recorded draw uses lives until its batch completes.
 struct Kept {
     std::shared_ptr<ShaderResources> resources;
@@ -1558,7 +1590,7 @@ struct Kept {
 // The completion side of a recorded draw: the kept objects, the record check, the lease outcome,
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
-void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::uint32_t> slices, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
+void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::span<const TargetWrite> writes, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
     auto kept = std::make_shared<Kept>();
     kept->resources = resources;
     kept->pipeline = std::move(pipeline);
@@ -1598,9 +1630,14 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
         else recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
     }
     for (std::size_t index = 0; index < residents.size(); ++index) {
-        if (residents[index] == nullptr) continue;
-        if (index < slices.size()) residents[index]->MarkSliceDirty(slices[index]);
-        else residents[index]->MarkDirty();
+        const auto& resident = residents[index];
+        if (resident == nullptr) continue;
+        if (index >= writes.size() || writes[index].whole) {
+            resident->MarkDirty();
+            continue;
+        }
+        const auto& write = writes[index];
+        resident->MarkDirtyRegion(write.mip, write.depthSlice, write.depthSlices, write.arraySlice, write.area);
     }
     for (const auto& resident : residents) {
         if (resident == nullptr || resident->Descriptor().tileMode != TextureTileMode::kLinear) continue;
@@ -1619,7 +1656,7 @@ struct RecordedDraw {
     std::shared_ptr<Framebuffer> framebuffer;
     std::span<const VkImageView> targetViews;
     std::vector<std::shared_ptr<StorageTexture>> targets;
-    std::vector<std::uint32_t> targetSlices;
+    std::vector<TargetWrite> writes;
     std::vector<std::shared_ptr<void>> multisampleTargets;
     std::vector<std::shared_ptr<StorageTexture>> proxies;
     std::vector<VkImage> multisampleImages;
@@ -1943,7 +1980,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
     timer.phase(PhaseRecord);
-    keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
+    keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), record.writes, std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
     timer.phase(PhaseKeep);
     if (record.waited) {
         // The wait the dispatch path makes for such work (source 3, "address-based"): the
@@ -2341,9 +2378,12 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     owners.reserve(targets.size());
     std::vector<std::shared_ptr<void>> framebufferOwners;
     framebufferOwners.reserve(targets.size());
+    std::vector<TargetWrite> writes;
+    writes.reserve(targets.size());
     for (const auto& binding : targets) {
         owners.push_back(binding.resident);
         framebufferOwners.push_back(binding.multisampled ? binding.multisampleOwner : binding.resident);
+        writes.push_back(targetWrite(state, binding.color, binding.multisampled || binding.proxied));
     }
     auto framebuffer = pipeline->AcquireFramebuffer(targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
     timer.phase(PhasePipeline);
@@ -2357,7 +2397,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         record.framebuffer = framebuffer;
         record.targetViews = targetViews;
         record.targets = owners;
-        for (const auto& binding : targets) record.targetSlices.push_back(binding.color.arraySlice);
+        record.writes = writes;
         for (const auto& binding : targets) {
             if (binding.proxied) record.proxies.push_back(binding.resident);
             if (binding.multisampled) {
@@ -2571,7 +2611,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("SubmitAndWait");
     timer.phase(PhaseRecord);
     if (recorded) {
-        keepRecordedDraw(*recorder, resources, pipeline, framebuffer, inputs, owners, [&] { std::vector<std::uint32_t> slices; for (const auto& binding : targets) slices.push_back(binding.color.arraySlice); return slices; }(), std::move(scratch), std::move(checkRecords), listed, completion, outcome);
+        keepRecordedDraw(*recorder, resources, pipeline, framebuffer, inputs, owners, writes, std::move(scratch), std::move(checkRecords), listed, completion, outcome);
         timer.phase(PhaseKeep);
         if (outcome.waited) {
             // The wait the dispatch path makes for such work (source 3, "address-based"): the
@@ -2617,7 +2657,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         if (skipTargetWrite) break;
         if (binding.resident != nullptr) {
             // The results stay on the GPU until something reads the target's memory.
-            binding.resident->MarkSliceDirty(binding.color.arraySlice);
+            const auto write = targetWrite(state, binding.color, binding.multisampled || binding.proxied);
+            if (write.whole) binding.resident->MarkDirty();
+            else binding.resident->MarkDirtyRegion(write.mip, write.depthSlice, write.depthSlices, write.arraySlice, write.area);
             continue;
         }
         if (binding.gpuTiling) GuestMemory::WriteChanged(binding.color.address, binding.tiled->Bytes(), binding.original);
@@ -2760,7 +2802,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     record.framebuffer = std::move(framebuffer);
     record.targetViews = recipe.targetViews;
     record.targets = std::move(targets);
-    for (const auto& color : state.colors) record.targetSlices.push_back(color.arraySlice);
+    for (const auto& color : state.colors) record.writes.push_back(targetWrite(state, color, AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED));
     record.pushBytes = &recipe.pushBytes;
     record.pushStages = recipe.pushStages;
     recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs);
