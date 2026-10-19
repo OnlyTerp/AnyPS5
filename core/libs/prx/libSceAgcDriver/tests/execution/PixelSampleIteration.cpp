@@ -527,7 +527,20 @@ void ExpectOrderModules() {
         Require(std::ranges::any_of(module.tables, customTable), name + ": no 32-entry table of every pixel's custom sample locations");
         CheckOrderIndex(module, order, name + ": an iterated PERSP_SAMPLE on a reordered pattern varying across the 2x2 grid");
     }
-    std::puts("recompiled modules index each pixel's location table by the guest sample index and the 2x2 quad term");
+    for (const std::uint32_t samples : {2u, 4u}) {
+        const auto name = std::to_string(samples) + "x";
+        for (const bool iterated : {false, true}) {
+            Pass pass;
+            pass.samples = samples;
+            pass.inputs = Ancillary;
+            pass.iterated = iterated;
+            pass.order = order;
+            Require(Has(PixelModule(pass, true), spv::BuiltInFragCoord), name + ": a pixel shader that only reorders its samples was not given the position input");
+            pass.order = {};
+            Require(!Has(PixelModule(pass, true), spv::BuiltInFragCoord), name + ": a pixel shader with nothing needing a position got one anyway");
+        }
+    }
+    std::puts("recompiled modules index each pixel's location table by the guest sample index and the 2x2 quad term, and request the position input for the sample order alone");
 }
 
 void ExpectSampleLocations() {
