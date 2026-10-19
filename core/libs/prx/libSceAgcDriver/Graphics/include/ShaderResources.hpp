@@ -240,6 +240,8 @@ public:
     std::shared_ptr<const void> ReleaseSpace() { return guestMemory.ReleaseSpace(); }
     bool UsesAddressTable() const { return usesBda; }
     bool UsesDeviceImages() const { return deviceImages; }
+    bool StoresThroughAddresses() const { return usesBda && !bdaReadOnly; }
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>>& AddressWrites() const { return addressWrites; }
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
     bool CopiedWritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.CopiedWritesOverlap(address, bytes); }
@@ -561,6 +563,7 @@ private:
     bool usesBda = false;
     bool bdaReadOnly = true;
     bool spaceReuse = false;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> addressWrites;
     std::vector<std::uint64_t> multisampleSources;
     bool usesFaultBuffer = false;
     bool faultChecks = false;

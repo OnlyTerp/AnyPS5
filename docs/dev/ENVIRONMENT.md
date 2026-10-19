@@ -191,6 +191,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_NO_BARRIER_ELISION` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | records every leading barrier instead of merging it into the following submission |
 | `APS5_NO_BDA_TABLE_CACHE` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/BdaResources.cpp` |  | builds every BDA descriptor table instead of reusing the recent-table cache |
 | `APS5_NO_BLOCK_TRACKING` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | tracks array layers, or the whole surface, instead of 64 KiB blocks |
+| `APS5_NO_BOUNDED_ADDRESS_PASSES` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | treats every address-based draw as an unknown writer of all guest memory, breaking render passes across BDA draws |
 | `APS5_NO_BUFFER_CLASSES` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/BufferPool.cpp` |  | matches exact sizes in the buffer pool instead of rounding up to size classes |
 | `APS5_NO_CACHED_PRECOLLECT` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | leaves the write-watch walks of a cached object's Revalidate under the GPU mutex |
 | `APS5_NO_CLEARED_VIEW` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` |  | keeps fast-cleared surfaces as CPU snapshots instead of viewing the cleared storage image |

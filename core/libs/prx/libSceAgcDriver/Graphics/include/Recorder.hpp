@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BarrierBatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PendingWriteRanges.hpp"
 #include <unordered_map>
 #include <atomic>
 #include <chrono>
@@ -875,8 +876,8 @@ private:
     std::map<DrawSnapshotKey, IndexRange> indexRanges;
     std::list<DrawSnapshotKey> indexRangeRecency;
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
-    mutable std::weak_ptr<const WriteRanges> publishedWriteRanges;
-    mutable bool publishedWriteRangesValid = false;
+    mutable AgcDriver::Graphics::PendingWriteRanges publishedWrites;
+    mutable std::vector<AgcDriver::Graphics::PendingWriteRanges::Source> publishSources;
 };
 
 }

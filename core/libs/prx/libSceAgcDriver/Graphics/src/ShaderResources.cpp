@@ -2268,6 +2268,7 @@ void ShaderResources::buildComplete() {
         timing.uploadMs += phase(BuildPhase::Upload);
         if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
+        if (usesBda && !bdaReadOnly) addressWrites = guestMemory.WritableAddressRanges();
         finishImageTables();
         phase(BuildPhase::Bda);
         if (_set != VK_NULL_HANDLE || fragment.set != VK_NULL_HANDLE) {

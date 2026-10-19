@@ -5065,6 +5065,27 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
     return merged;
 }
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::WritableAddressRanges() const {
+    const auto cached = CachedAddressTable();
+    std::vector<ShaderRecompiler::BdaAbi::Range> built;
+    if (!cached.has_value()) built = AddressRanges();
+    const auto& ranges = cached.has_value() ? *cached->ranges : built;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writable;
+    for (const auto& range : ranges) {
+        if ((range.permissions & ShaderRecompiler::BdaAbi::Write) != 0u && range.begin < range.end) writable.emplace_back(range.begin, range.end);
+    }
+    for (const auto& written : writes) {
+        if (written.first < written.second) writable.push_back(written);
+    }
+    std::sort(writable.begin(), writable.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    for (const auto& range : writable) {
+        if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+        else merged.push_back(range);
+    }
+    return merged;
+}
+
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {
     if (space == nullptr) return std::nullopt;
     Require(uploaded && !committed, "guest GPU address ranges are not available");
