@@ -958,11 +958,13 @@ void AbiDeferredCompute() {
     caller.shader.specials = &caller.specials;
     caller.specials.dispatch_modifier = 0x8000u;
     AgcDriverRegisterShader_nid_postfix(&caller.shader);
+    const bool lazy = std::getenv("APS5_LAZY_SHADER_PREPARE") != nullptr;
     const auto before = ShaderRecompiler::FrontEndBuilds();
     AgcDriverResolveShaderAbi_nid_postfix(&caller.shader, {}, {});
     const auto attempted = ShaderRecompiler::FrontEndBuilds();
     AgcDriverResolveShaderAbi_nid_postfix(&caller.shader, {}, {});
-    Require(attempted > before && ShaderRecompiler::FrontEndBuilds() == attempted, "a compute static ABI deferred to its dispatch was prepared again for the same state");
+    if (lazy) Require(attempted == before && ShaderRecompiler::FrontEndBuilds() == attempted, "a compute static ABI resolved under lazy preparation built its front end before its dispatch");
+    else Require(attempted > before && ShaderRecompiler::FrontEndBuilds() == attempted, "a compute static ABI deferred to its dispatch was prepared again for the same state");
     const auto first = reinterpret_cast<std::uintptr_t>(AddFiveCallee.data());
     const auto second = reinterpret_cast<std::uintptr_t>(AddSixtyFourCallee.data());
     const auto output = reinterpret_cast<std::uintptr_t>(CallerOutput.data());
