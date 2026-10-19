@@ -6,6 +6,7 @@
 #endif
 #include <mutex>
 #include <vulkan/vulkan.h>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -133,6 +134,8 @@ inline std::uint64_t& DeviceProcLookups() {
 
 inline constexpr std::size_t EmptyBufferBytes = 16;
 
+inline constexpr std::size_t MaxRecorderStreams = 16;
+
 struct Context {
     VkDevice device;
     VkPhysicalDevice physical;
@@ -244,6 +247,8 @@ struct Context {
         return pipelineCacheSynchronization != nullptr ? pipelineCacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
     }
     VertexInputCache* vertexInputs = nullptr;
+    std::array<VkQueue, MaxRecorderStreams> streamQueues{};
+    std::uint32_t streamQueueCount = 0;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {
