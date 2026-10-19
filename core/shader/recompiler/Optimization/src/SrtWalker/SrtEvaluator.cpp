@@ -413,6 +413,9 @@ EvaluatorReads BasicEvaluator<TNode>::Reads(const IrResourcePlan& program, const
         case IrOpcode::BitFieldUExtract:
         case IrOpcode::BitFieldSExtract:
         case IrOpcode::BitFieldInsert:
+        case IrOpcode::BitCount32:
+        case IrOpcode::FindILsb32:
+        case IrOpcode::FindUMsb32:
         case IrOpcode::SelectU32:
         case IrOpcode::SelectU1:
         case IrOpcode::SelectF32:

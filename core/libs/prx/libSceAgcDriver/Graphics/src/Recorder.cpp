@@ -3165,10 +3165,11 @@ void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std
     forEachOpen(add);
     for (const auto& batch : inFlight) add(*batch);
     for (const auto* batch : finishing) add(*batch);
-    auto published = publishedWrites.Publish(sources, pendingWrites.load(std::memory_order_acquire));
-    pendingWrites.store(std::move(published.snapshot), std::memory_order_release);
+    auto built = publishedWrites.Publish(sources, pendingWrites.load(std::memory_order_acquire));
+    published = built.snapshot;
+    pendingWrites.store(std::move(built.snapshot), std::memory_order_release);
     publishGeneration.fetch_add(1, std::memory_order_release);
-    if (published.rebuilt) ++snapshotRebuilds;
+    if (built.rebuilt) ++snapshotRebuilds;
     if (DrawProfiled()) snapshotRebuildMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
 }
 

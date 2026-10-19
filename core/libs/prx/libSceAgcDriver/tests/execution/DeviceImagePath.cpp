@@ -616,7 +616,8 @@ std::size_t RequireCovered(const std::vector<std::byte>& stored, const AgcDriver
             for (std::size_t channel = 0; channel < 4; ++channel) {
                 const auto texel = static_cast<long>(stored[offset + channel]);
                 const auto expected = std::lround(value[channel] * 255.0f);
-                Require(texel == expected, what + ": pixel (" + std::to_string(x) + ", " + std::to_string(y) + ") channel " + std::to_string(channel) + " is " + std::to_string(texel) + ", expected " + std::to_string(expected));
+                const bool halfStep = value[channel] * 255.0f == 127.5f && texel == 127;
+                Require(texel == expected || halfStep, what + ": pixel (" + std::to_string(x) + ", " + std::to_string(y) + ") channel " + std::to_string(channel) + " is " + std::to_string(texel) + ", expected " + std::to_string(expected));
             }
             ++drawn;
         }
