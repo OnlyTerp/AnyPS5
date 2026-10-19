@@ -6971,7 +6971,6 @@ void pipelineLibraryClearWaitsForBuildTests() {
 }
 
 void pipelineLibraryConcurrencyTests() {
-void framebufferOwnerTests() {
     using namespace AgcDriver::Graphics;
     mock = MockVulkan{};
     auto context = mockContext();
@@ -7120,6 +7119,14 @@ void cachedPipelineConcurrencyTests() {
     second.reset();
     ClearCachedPipelines(context.device);
     Require(mock.live == 0, "cached pipeline concurrency tests leaked Vulkan objects");
+}
+
+void framebufferOwnerTests() {
+    using namespace AgcDriver::Graphics;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.graphicsPipelineLibrary = true;
+    context.pipelineLinkTimeOptimization = false;
     context.limits.maxColorAttachments = 1;
     context.limits.maxFramebufferWidth = 4;
     context.limits.maxFramebufferHeight = 4;

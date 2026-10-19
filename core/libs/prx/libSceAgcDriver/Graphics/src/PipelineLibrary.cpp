@@ -248,11 +248,9 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         }
         VkPipeline handle = VK_NULL_HANDLE;
         lock.unlock();
-        VkResult created;
-        {
+        try {
             std::optional<CreationGate> gate;
             if (partWords[part] != 0) gate.emplace(partWords[part]);
-    const bool underLock = GuestMemory::GpuMutex().HeldByThisThread();
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
             Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle), "vkCreateGraphicsPipelines library");
         } catch (...) {

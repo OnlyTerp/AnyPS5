@@ -823,9 +823,6 @@ struct WriteTracker {
         std::array<std::uint32_t, LeafBlocks> blocks{};
         std::array<std::uint32_t, LeafBlocks> cpuBlocks{};
         std::array<std::uint32_t, LeafBlocks / CoarseBlocks> coarseBlocks{};
-#ifdef _WIN32
-        std::array<std::uint32_t, LeafBlocks> hintBlocks{};
-#endif
     };
     using HintLeaf = std::array<std::uint32_t, LeafBlocks>;
     std::vector<std::unique_ptr<Leaf>> leaves;
@@ -833,10 +830,7 @@ struct WriteTracker {
     std::uintptr_t base = 0;
     std::size_t size = 0;
     WriteWatchCoverage coverage;
-<<<<<<< HEAD
-=======
     std::vector<std::unique_ptr<HintLeaf>> hintLeaves;
->>>>>>> fork/arch/b-sampled-snapshot-and-stacks-clean
 #else
     static constexpr std::size_t LeafCount = std::size_t{1} << 15;
 #endif
@@ -870,12 +864,8 @@ struct WriteTracker {
         GuestArena::GuestArenaRange_nid_postfix(&base, &size);
         watched = size != 0 && GuestArena::GuestArenaWriteWatched_nid_postfix();
         if (!watched) return;
-<<<<<<< HEAD
-        leaves.resize((size / WriteBlockBytes + LeafBlocks) / LeafBlocks);
-=======
         leaves.resize(size / WriteBlockBytes / LeafBlocks + 1);
         hintLeaves.resize(leaves.size());
->>>>>>> fork/arch/b-sampled-snapshot-and-stacks-clean
         coverage.Initialize(base, size);
         pages.resize(1u << 16);
         GuestArena::GuestArenaSetPrivateMappingObserver_nid_postfix(&watchPrivateMapping);
@@ -919,11 +909,7 @@ struct WriteTracker {
             if (!coverage.Covers(blockBegin(block), 1)) continue;
             if (!started) ++generation;
             started = true;
-<<<<<<< HEAD
-            stampHint(block);
-=======
             hint(block, generation);
->>>>>>> fork/arch/b-sampled-snapshot-and-stacks-clean
         }
     }
 
@@ -1049,26 +1035,6 @@ struct WriteTracker {
         slot = {stampGeneration, from, to};
     }
 
-<<<<<<< HEAD
-    Leaf& leafFor(std::uint64_t block) {
-        auto& leaf = leaves[block / LeafBlocks];
-        if (leaf == nullptr) leaf = std::make_unique<Leaf>();
-        return *leaf;
-    }
-
-#ifdef _WIN32
-    void stampHint(std::uint64_t block) {
-        leafFor(block).hintBlocks[block % LeafBlocks] = generation;
-    }
-
-    std::uint32_t hintOf(std::uint64_t block) const {
-        const auto& leaf = leaves[block / LeafBlocks];
-        return leaf != nullptr ? leaf->hintBlocks[block % LeafBlocks] : 0;
-    }
-#endif
-
-=======
->>>>>>> fork/arch/b-sampled-snapshot-and-stacks-clean
     std::uint32_t stampOf(std::uint64_t block) const {
         const auto& leaf = leaves[block / LeafBlocks];
         return leaf != nullptr ? leaf->blocks[block % LeafBlocks] : 0;
@@ -1172,15 +1138,6 @@ struct WriteTracker {
     void stamp(std::uint64_t block, std::uint32_t stampGeneration, StampKind kind) {
         const bool cpu = kind == StampKind::Cpu || kind == StampKind::ImportWindow;
         const bool stored = kind != StampKind::ImportWindow;
-<<<<<<< HEAD
-        auto& leaf = leafFor(block);
-        if (stored) {
-            leaf.blocks[block % LeafBlocks] = stampGeneration;
-            auto& coarse = leaf.coarseBlocks[(block % LeafBlocks) / CoarseBlocks];
-            coarse = std::max(coarse, stampGeneration);
-        }
-        if (cpu) leaf.cpuBlocks[block % LeafBlocks] = stampGeneration;
-=======
         auto& leaf = leaves[block / LeafBlocks];
         if (leaf == nullptr) leaf = std::make_unique<Leaf>();
         if (stored) {
@@ -1198,7 +1155,6 @@ struct WriteTracker {
         for (const auto& leaf : hintLeaves) bytes += leaf != nullptr ? sizeof(HintLeaf) : 0;
 #endif
         return bytes;
->>>>>>> fork/arch/b-sampled-snapshot-and-stacks-clean
     }
 };
 
@@ -1841,11 +1797,7 @@ bool walkHints(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
         if (!GuestArena::GuestArenaCollectWrites_nid_postfix(static_cast<std::uintptr_t>(cursor), static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, true)) return false;
         if (count != 0 && !marked) ++tracker.generation;
         marked = marked || count != 0;
-<<<<<<< HEAD
-        for (std::size_t i = 0; i < count; ++i) tracker.stampHint(tracker.blockOf(reinterpret_cast<std::uintptr_t>(tracker.pages[i])));
-=======
         for (std::size_t i = 0; i < count; ++i) tracker.hint(tracker.blockOf(reinterpret_cast<std::uintptr_t>(tracker.pages[i])), tracker.generation);
->>>>>>> fork/arch/b-sampled-snapshot-and-stacks-clean
         if (count < tracker.pages.size()) break;
         cursor = reinterpret_cast<std::uintptr_t>(tracker.pages[count - 1]) + WritePageBytes;
     }
