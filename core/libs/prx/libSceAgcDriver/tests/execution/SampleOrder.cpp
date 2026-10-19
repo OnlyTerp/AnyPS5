@@ -713,6 +713,7 @@ struct Pass {
     std::optional<AgcDriver::Graphics::ColorTarget> color;
     std::optional<std::array<std::uint8_t, 32>> locations;
     std::optional<SampleOrder> order;
+    std::array<std::uint16_t, 4> quadSampleMask{0xffffu, 0xffffu, 0xffffu, 0xffffu};
     bool storesInvocations = false;
     std::function<void()> beforeReplay;
     bool buildsNoRecipe = false;
@@ -755,6 +756,7 @@ void Draw(AgcDriver::VulkanDevice& device, const Context& context, const Pass& p
     state.blendConstants = {};
     state.samples = pass.samples;
     state.perSampleShading = pass.perSample;
+    state.quadSampleMask = pass.quadSampleMask;
     state.pixelEarlyZ = AgcDriver::Graphics::PixelEarlyZ(pass.shaderControl);
     if (pass.locations) {
         state.customSampleLocations = true;
@@ -931,6 +933,64 @@ void CoverageRemap(AgcDriver::VulkanDevice& device, const Context& context, std:
     std::printf("%ux exported sample masks reach the host samples at the guest samples' locations\n", samples);
 }
 
+void CoverageOrder(AgcDriver::VulkanDevice& device, const Context& context, std::uint32_t samples) {
+    const auto order = OrderFor(samples);
+    const auto toNdc = [](float pixel) { return pixel * 2.0f / static_cast<float>(RemapWidth) - 1.0f; };
+    const auto rectangle = Rectangle(toNdc(2.5f), toNdc(5.5f), 0.5f);
+    const auto back = Screen(0.25f), probe = Screen(0.375f);
+    const AgcDriver::Graphics::DepthTarget depth = [&] {
+        AgcDriver::Graphics::DepthTarget target{reinterpret_cast<std::uintptr_t>(DepthMemory.data()) + 256u * 1024u * (static_cast<std::uint32_t>(std::countr_zero(samples)) + 4u), 0u, {RemapWidth, RemapHeight}, VK_FORMAT_D32_SFLOAT, 0.0f, 0};
+        target.samples = samples;
+        return target;
+    }();
+    const std::array<std::uint16_t, 4> mask{2u, 2u, 2u, 4u};
+    const auto full = (1u << samples) - 1u;
+    const auto covered = [&](std::uint32_t x, std::uint32_t y) {
+        std::uint32_t host = 0u;
+        for (std::uint32_t sample = 0; sample < samples; ++sample) {
+            const auto at = static_cast<float>(x) + StandardX(samples, sample);
+            if (at > 2.5f && at < 5.5f) host |= 1u << sample;
+        }
+        return GuestBits(host, order[Quad(x, y)], samples) & (mask[Quad(x, y)] & full);
+    };
+    Pass reset;
+    reset.vertices = &back;
+    reset.code = NullExportCode;
+    reset.samples = samples;
+    reset.depth = depth;
+    reset.depthWrite = true;
+    Draw(device, context, reset);
+    Invocations.fill(0u);
+    Pass masked;
+    masked.vertices = &rectangle;
+    masked.code = StoreCode(samples);
+    masked.perSample = true;
+    masked.samples = samples;
+    masked.depth = depth;
+    masked.depthWrite = true;
+    masked.order = order;
+    masked.quadSampleMask = mask;
+    masked.storesInvocations = true;
+    Draw(device, context, masked);
+    Settle(device);
+    CheckStored(samples, std::to_string(samples) + "x a quad sample mask reached the pixel shader in the guest's order", covered);
+    Invocations.fill(0u);
+    Pass check;
+    check.vertices = &probe;
+    check.code = StoreCode(samples);
+    check.perSample = true;
+    check.shaderControl = 0x10u;
+    check.samples = samples;
+    check.depth = depth;
+    check.depthCompare = VK_COMPARE_OP_LESS;
+    check.order = order;
+    check.storesInvocations = true;
+    Draw(device, context, check);
+    Settle(device);
+    CheckStored(samples, std::to_string(samples) + "x a quad sample mask exported through the sample order landed on the host's samples", covered);
+    std::printf("%ux a quad sample mask reaches the pixel shader in the guest's order and exports coverage in the host's\n", samples);
+}
+
 std::uint32_t ShaderRemaps(AgcDriver::VulkanDevice& device, const Context& context) {
     std::uint32_t checked = 0;
     for (const std::uint32_t samples : {2u, 4u, 8u}) {
@@ -942,6 +1002,7 @@ std::uint32_t ShaderRemaps(AgcDriver::VulkanDevice& device, const Context& conte
             std::printf("skipped the %ux SampleID check: the device has no standard sample locations\n", samples);
         }
         CoverageRemap(device, context, samples);
+        CoverageOrder(device, context, samples);
         ++checked;
     }
     return checked;
