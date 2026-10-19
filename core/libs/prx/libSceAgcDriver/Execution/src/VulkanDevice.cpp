@@ -3002,6 +3002,7 @@ FrameDumps& Dumps() {
 }
 
 bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
+    if (buffer.dccAddress != 0 && buffer.tilingMode == 0) state->recorder->SyncThrough(buffer.dccAddress, DisplayBufferKeyBytes(buffer), true);
     static const bool storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
     if (storeAtFlip) Graphics::StorageTexture::FlushAllPending("flip");
     else Graphics::StorageTexture::FlushDumpSelected("flip");
@@ -3692,6 +3693,14 @@ void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     Graphics::RunColorMetadataPass(graphicsContext(), pass);
 }
 
+bool VulkanDevice::PrepareDrawPipelines(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) {
+    PerformanceTimer timing("Vulkan.DrawPipelinePreparation");
+    const auto context = graphicsContext();
+    if (!context.graphicsPipelineLibrary || context.descriptorCache == nullptr) return false;
+    const auto layouts = Graphics::DescribeSetLayouts(context, shaders);
+    return Graphics::Pipeline::Prebuild(context, graphics, Graphics::VertexInputLayout{}, layouts.View(), shaders);
+}
+
 bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders) {
     PerformanceTimer timing("Vulkan.GraphicsPipelinePrebuild");
     const auto context = graphicsContext();
@@ -4347,6 +4356,24 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
 VulkanDevice::PresyncStatistics VulkanDevice::PresyncCounts() {
     const auto& counters = Presyncs();
     return {counters.checked.load(std::memory_order_relaxed), counters.presyncs.load(std::memory_order_relaxed), counters.keyChecks.load(std::memory_order_relaxed), counters.keyWaits.load(std::memory_order_relaxed)};
+}
+
+void VulkanDevice::PrewarmAddressSpace() {
+    Graphics::GuestBufferMemory::Prewarm(graphicsContext());
+}
+
+std::uint64_t VulkanDevice::PresyncDraw(const Graphics::State& graphics) {
+    if (NoPresync() || !CanWaitUnlocked()) return 0;
+    const auto keyed = [](const Graphics::ColorTarget& color) { return color.address != 0 && color.bytes != 0 && color.dccAddress != 0 && Graphics::Recorder::SnapshotWriteOverlaps(color.dccAddress, Graphics::DccKeyBytes(color.bytes)); };
+    if (std::none_of(graphics.colors.begin(), graphics.colors.end(), keyed)) return 0;
+    std::vector<Graphics::PresyncSurface> surfaces;
+    {
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        for (const auto& color : graphics.colors) {
+            if (keyed(color) && Graphics::KeyWritersPending(Graphics::SurfaceForTarget(color), color.bytes)) surfaces.push_back({color.dccAddress, Graphics::DccKeyBytes(color.bytes), false});
+        }
+    }
+    return surfaces.empty() ? 0 : presync(surfaces);
 }
 
 std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t dispatchThreads, std::uint64_t programAddress) {

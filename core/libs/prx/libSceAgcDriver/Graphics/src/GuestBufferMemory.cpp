@@ -121,11 +121,33 @@ struct GuestBufferMemory::AddressSpace {
     };
     mutable std::map<std::vector<std::uint64_t>, Table> tables;
     mutable std::list<const std::vector<std::uint64_t>*> tableRecency;
+    std::shared_ptr<const void> retired;
 };
 
 namespace {
 
 struct RetiredImport;
+
+struct RetiredSet {
+    std::vector<std::shared_ptr<void>> held;
+    std::shared_ptr<RetiredSet> next;
+};
+
+struct RetiredImports {
+    std::mutex mutex;
+    std::shared_ptr<RetiredSet> current = std::make_shared<RetiredSet>();
+};
+
+RetiredImports& Retired() {
+    static RetiredImports retired;
+    return retired;
+}
+
+std::shared_ptr<const void> RetiredSince() {
+    auto& retired = Retired();
+    std::lock_guard lock(retired.mutex);
+    return retired.current;
+}
 
 struct AddressSpaceCache {
     AtomicSharedPtr<const GuestBufferMemory::AddressSpace> current;
@@ -237,6 +259,19 @@ struct HostImports {
 #endif
     std::uint64_t useCounter = 0;
     std::uint64_t buildFloor = 0;
+    bool retireAllowed = true;
+    bool retireRefused = false;
+};
+
+struct RetireScope {
+    HostImports& state;
+    RetireScope(HostImports& state, bool allowed) : state(state) {
+        state.retireAllowed = allowed;
+        state.retireRefused = false;
+    }
+    ~RetireScope() { state.retireAllowed = true; }
+    RetireScope(const RetireScope&) = delete;
+    RetireScope& operator=(const RetireScope&) = delete;
 };
 
 HostImports& Imports() {
@@ -331,6 +366,7 @@ bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::u
 bool joinedCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 
 void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease, bool hold = true) {
+    Require(state.retireAllowed, "a host import was retired outside the device lock");
 #ifdef _WIN32
     auto* reading = forgetSettle(state, it->first);
 #endif
@@ -341,6 +377,7 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     ++state.epoch;
     state.liveBytes -= it->second.bytes;
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, state.imports.extract(it));
+    RetainRetiredImport(holder);
 #ifdef _WIN32
     if (reading != nullptr) {
         reading->retired.push_back(holder);
@@ -1472,6 +1509,10 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         }
         return nullptr;
     }
+    if (!state.retireAllowed && ((first != state.imports.end() && first->first < base + bytes) || live + bytes > budget)) {
+        state.retireRefused = true;
+        return nullptr;
+    }
     for (auto it = first; it != state.imports.end() && it->first < base + bytes;) {
         const auto next = std::next(it);
         retireImport(context.device, state, it, lease);
@@ -1664,6 +1705,10 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     if (state.freeMemory == nullptr) state.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (generation == state.refreshedGeneration) return;
+    if (!state.retireAllowed && std::any_of(state.imports.begin(), state.imports.end(), [&](const auto& item) { return !sameRange(item.second, lease); })) {
+        state.retireRefused = true;
+        return;
+    }
     state.refreshedGeneration = generation;
     const auto starts = [&](std::uint64_t address) {
         const auto index = leasedIndexContaining(lease, address);
@@ -3128,9 +3173,28 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
     totals.snapshotsUs = 0;
 }
 
+void RetainRetiredImport(std::shared_ptr<void> holder) {
+    auto& retired = Retired();
+    std::lock_guard lock(retired.mutex);
+    retired.current->held.push_back(std::move(holder));
+    auto next = std::make_shared<RetiredSet>();
+    retired.current->next = next;
+    retired.current = std::move(next);
+}
+
+void GuestBufferMemory::Prewarm(const Context& context) {
+    if (!context.bufferDeviceAddress || !addressSpaceCacheEnabled()) return;
+    const auto current = Spaces().current.load();
+    if (current == nullptr || current->device != context.device) return;
+    if (current->generation == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && current->importsEpoch == Imports().epoch) return;
+    GuestBufferMemory warm(context);
+    warm.AcquireRegistered();
+}
+
 void GuestBufferMemory::AcquireRegistered() {
     Require(!uploaded && regions.empty() && lease.empty() && space == nullptr, "guest allocation lease must precede resource registration");
     ensurePinWaiter();
+    retiredSince = RetiredSince();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& timing = ThreadAddressTiming();
     const auto lap = [&](double& into, std::chrono::steady_clock::time_point& from) {
@@ -3200,25 +3264,30 @@ void GuestBufferMemory::AcquireRegistered() {
         }
     }
     if (space == nullptr) {
-        // Pending GPU results in these ranges are stored when Upload prepares each region.
         lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
         lap(timing.leaseUs, at);
-        {
+        std::unique_lock<GuestMemory::GpuMutexType> deviceLock(GuestMemory::GpuMutex(), std::defer_lock);
+        const bool retiring = GuestMemory::GpuMutex().HeldByThisThread();
+        const auto withImports = [&](const auto& body) {
             auto& state = Imports();
-            std::lock_guard lock(state.mutex);
+            for (;;) {
+                {
+                    std::lock_guard lock(state.mutex);
+                    const RetireScope scope(state, retiring || deviceLock.owns_lock());
+                    body(state);
+                    if (!state.retireRefused) return;
+                }
+                Require(!retiring && !deviceLock.owns_lock(), "a host import refused to retire under the device lock");
+                deviceLock.lock();
+            }
+        };
+        withImports([&](HostImports& state) {
             if (importable) refreshImports(context, state, lease);
             if (importFloor == 0) importFloor = state.useCounter + 1;
             state.buildFloor = importFloor;
-            // Taken before the pass: the imports it takes are the registry's ones (just reconciled, so
-            // none is retired by a make below), and a mirror's preparation may sync the recorder, whose
-            // completions can retire an import already taken; that moves the epoch, and Upload then
-            // re-checks every pointer instead of trusting it.
             importsEpoch = state.epoch;
-        }
+        });
         lap(timing.importsUs, at);
-        // One pass in the registry's (ascending) order, so the regions come out sorted for AddSnapshot.
-        // The import lock is taken per range: a mirror's preparation may wait for recorded work, which
-        // must not happen under it.
         regions.reserve(lease.size());
         std::vector<AddressCopy> copies;
         std::vector<std::uint64_t> imported;
@@ -3227,11 +3296,7 @@ void GuestBufferMemory::AcquireRegistered() {
             validate(range->address, range->bytes);
             Region region{range->address, range->address + range->bytes, range->writable, {}, nullptr};
             const HostImport* entry = nullptr;
-            if (importable) {
-                auto& state = Imports();
-                std::lock_guard lock(state.mutex);
-                entry = importAllocation(context, state, range->address, lease, 0, false);
-            }
+            if (importable) withImports([&](HostImports& state) { entry = importAllocation(context, state, range->address, lease, 0, false); });
             lap(timing.importsUs, at);
             if (entry != nullptr) {
                 region.hostBacked = true;
@@ -3319,6 +3384,7 @@ void GuestBufferMemory::AcquireRegistered() {
                 built->serial = spaces.serials.fetch_add(1, std::memory_order_relaxed) + 1;
                 built->lease = std::move(lease);
                 built->ranges = std::move(ranges);
+                built->retired = retiredSince;
                 std::vector<Region> extras;
                 for (auto& region : regions) {
                     if (region.direct != nullptr || region.mirror != nullptr) {

@@ -331,6 +331,9 @@ public:
     IndirectDrawSupport DrawIndirectSupport() const;
     void EnqueueDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {});
     bool PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders);
+    bool PrepareDrawPipelines(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders);
+    std::uint64_t PresyncDraw(const Graphics::State& graphics);
+    void PrewarmAddressSpace();
 
 private:
     VulkanDevice(const PresentationWindow* window, bool compileOnly);
