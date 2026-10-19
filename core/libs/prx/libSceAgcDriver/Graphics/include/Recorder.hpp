@@ -20,6 +20,7 @@
 #include <optional>
 #include <span>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -78,14 +79,14 @@ public:
     // unaligned head or tail; [begin, end) is the guest range. Debug aid: APS5_DCC_KEYS_EACH=1
     // records every store at once, as before (QueueKeyStore then records and returns).
     void QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize last, std::shared_ptr<void> seed, std::uint64_t begin, std::uint64_t end);
-    bool HasQueuedKeyStores() const { return open != nullptr && !open->keyStores.empty(); }
+    bool HasQueuedKeyStores() const { const auto* open = callerBatch(); return open != nullptr && !open->keyStores.empty(); }
     bool QueuedKeyStoreOverlaps(std::uint64_t address, std::size_t bytes) const;
     // Whether `overlaps(begin, end)` holds for a queued store's range.
     bool AnyQueuedKeyStore(const std::function<bool(std::uint64_t, std::uint64_t)>& overlaps) const;
     void FlushKeyStores();
     void FlushKeyStoresOverlapping(std::uint64_t address, std::size_t bytes) { if (HasQueuedKeyStores() && QueuedKeyStoreOverlaps(address, bytes)) FlushKeyStores(); }
-    bool Recording() const { return open != nullptr; }
-    bool Idle() const { return open == nullptr && inFlight.empty(); }
+    bool Recording() const { return anyOpen(); }
+    bool Idle() const { return !anyOpen() && inFlight.empty(); }
     std::uint64_t OpenSerial() const { return submissions + 1; }
     std::uint64_t CompletedThrough() const { return inFlight.empty() ? submissions : inFlight.front()->serial - 1; }
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
@@ -93,7 +94,7 @@ public:
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
     void KeepThroughHold(std::shared_ptr<void> object);
     void KeepBytes(const void* owner, std::size_t bytes);
-    std::size_t OpenKeptBytes() const { return open != nullptr ? open->keptBytes : 0; }
+    std::size_t OpenKeptBytes() const { const auto* open = callerBatch(); return open != nullptr ? open->keptBytes : 0; }
     void FlushDeferredReleases();
     static constexpr std::size_t KeptBytesBudget = std::size_t{512} << 20u;
     void BoundKeptBytes();
@@ -200,7 +201,27 @@ public:
     // Submits the open batch and returns the serial of the newest submitted batch (0 when nothing was
     // ever submitted); WaitSerial(serial) then covers all recorded work.
     std::uint64_t SubmitAndEpoch();
-    bool HasTimeline() const { return timeline != VK_NULL_HANDLE; }
+    bool HasTimeline() const { return streams.front().timeline != VK_NULL_HANDLE; }
+    std::size_t Streams() const { return streams.size(); }
+    struct QueuePoint {
+        VkSemaphore timeline;
+        std::uint64_t value;
+    };
+    std::vector<QueuePoint> OtherQueuePoints() const;
+    struct SectionObject {
+        const void* object;
+        bool written;
+    };
+    void DeclareSection(std::span<const SectionObject> objects);
+    void OrderAfterLabel(std::uint64_t address, std::size_t bytes);
+    void OrderAfterValue(std::uint64_t address, std::size_t bytes);
+    void OrderAfterQueue(std::uint32_t queue);
+    static std::uint64_t LabelTableLookups();
+    using Token = std::array<std::uint64_t, MaxRecorderStreams>;
+    Token CallerToken();
+    Token AllToken() const;
+    bool Reached(const Token& token) const;
+    void WaitToken(const Token& token);
     bool RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments);
     // Waits until every batch up to `serial` completed on the GPU. Called WITHOUT GuestMemory::GpuMutex:
     // it touches only the immutable timeline semaphore (the caller keeps the device alive). Requires
@@ -268,7 +289,7 @@ public:
     // stores at once and closes the run at the next command (Commands()) or at Submit, as
     // before; APS5_NO_LABEL_RUNS=1 gives every store barriers of its own.
     void RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address);
-    bool HasQueuedStores() const { return open != nullptr && !open->run.queued.empty(); }
+    bool HasQueuedStores() const { const auto* open = callerBatch(); return open != nullptr && !open->run.queued.empty(); }
     bool QueuedStoreOverlaps(std::uint64_t address, std::size_t bytes) const;
     // Whether `overlaps(begin, end)` holds for a queued store's guest range.
     bool AnyQueuedStore(const std::function<bool(std::uint64_t, std::uint64_t)>& overlaps) const;
@@ -570,6 +591,9 @@ private:
         std::uint64_t serial = 0;
         std::uint64_t traceId = 0;
         bool submitted = false;
+        std::uint32_t stream = 0;
+        std::uint64_t value = 0;
+        std::array<std::uint64_t, MaxRecorderStreams> waits{};
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
         std::uint32_t queue = 0xffffffffu;
@@ -805,7 +829,57 @@ private:
     bool unsignaled(std::uint64_t serial) const;
 
     Context context;
-    VkSemaphore timeline = VK_NULL_HANDLE;
+    struct Stream {
+        VkQueue queue = VK_NULL_HANDLE;
+        VkSemaphore timeline = VK_NULL_HANDLE;
+        std::uint64_t opened = 0;
+        std::uint64_t submitted = 0;
+        std::uint64_t finished = 0;
+        std::uint64_t barrier = 0;
+        Batch* newest = nullptr;
+    };
+    struct ObjectUse {
+        std::array<std::uint64_t, MaxRecorderStreams> read{};
+        std::array<std::uint64_t, MaxRecorderStreams> written{};
+    };
+    std::unordered_map<const void*, ObjectUse> objectUses;
+    static constexpr std::size_t ObjectSweepMinimum = 4096;
+    std::size_t objectSweepAt = ObjectSweepMinimum;
+    std::vector<SectionObject> declaredObjects;
+    bool sectionDeclared = false;
+    using Epoch = std::array<std::uint64_t, MaxRecorderStreams>;
+    void dependOn(std::uint32_t other, std::uint64_t value);
+    void keepOnOtherStreams(const std::shared_ptr<void>& object);
+    void sweepObjectUses();
+    void closeEpoch(Epoch& epoch) const;
+    void finishEpoch(Epoch epoch, int source);
+    Epoch syncTargets(std::uint64_t address, std::uint64_t end);
+    bool epochUnsignaled(const Epoch& epoch) const;
+    std::vector<Stream> streams;
+    mutable std::array<std::uint8_t, 0x58> queueStreams{};
+    mutable std::uint32_t nextStream = 1;
+    static constexpr std::uint32_t NoStream = 0xffffffffu;
+    std::uint32_t submittingStream = NoStream;
+    std::uint32_t streamOfCaller() const;
+    std::unique_ptr<Batch>& callerOpen();
+    const Batch* callerBatch() const;
+    bool anyOpen() const;
+    void submitStream(std::uint32_t stream);
+    void beginSection();
+    template<typename TVisit>
+    void forEachOpen(TVisit&& visit) const {
+        for (std::size_t stream = 0; stream < streams.size(); ++stream) {
+            if (opens[stream] != nullptr) visit(*opens[stream]);
+        }
+    }
+    const Batch* openOverlapping(std::uint64_t address, std::uint64_t end) const;
+    Batch* callerNewest();
+    VkCommandBuffer batchCommands(VkAccessFlags* coveredAccess = nullptr);
+    struct SubmittedValues {
+        std::uint64_t serial = 0;
+        std::array<std::uint64_t, MaxRecorderStreams> values{};
+    };
+    std::array<SubmittedValues, CompletedRingSize> submittedValues{};
     // Identity for a thread that released the mutex around a wait (syncThroughUnlocked): the
     // recorder may have been torn down meanwhile, so it is looked up by this id, not by pointer.
     std::uint64_t id = 0;
@@ -822,7 +896,7 @@ private:
     // labels.size(), readable without the table mutex: a noted write skips the mutex while the
     // table is empty (most of the time between label groups).
     std::atomic<std::size_t> recordedLabels{0};
-    std::unique_ptr<Batch> open;
+    std::array<std::unique_ptr<Batch>, MaxRecorderStreams> opens;
     std::vector<std::shared_ptr<void>> holdKept;
     std::uint64_t holdKeptSerial = 0;
     std::deque<std::unique_ptr<Batch>> inFlight;

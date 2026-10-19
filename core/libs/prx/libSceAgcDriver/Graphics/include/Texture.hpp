@@ -106,6 +106,7 @@ public:
     VkFormat ViewFormat() const { return viewFormat; }
     // Whether this texture is a view of a storage image (no snapshot of its own).
     bool ViewsStorageImage() const { return storageSource != nullptr; }
+    VkImage SampledImage() const { return sampledImage; }
     const StorageTexture* StorageSource() const { return storageSource.get(); }
     const std::shared_ptr<StorageTexture>& SharedStorageSource() const { return storageSource; }
     // The last key scan of the sampled surface (ProvedClearKeys), for surfaces whose keys are not
@@ -144,6 +145,7 @@ private:
     std::optional<VkImageViewCreateInfo> baseLevelInfo;
     mutable std::mutex baseLevelMutex;
     mutable VkImageView baseLevelView = VK_NULL_HANDLE;
+    VkImage sampledImage = VK_NULL_HANDLE;
     std::optional<VkImageViewCreateInfo> srgbInfo;
     float srgbMinLod = 0.0f;
     mutable std::mutex srgbMutex;

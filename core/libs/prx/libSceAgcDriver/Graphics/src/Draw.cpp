@@ -2042,6 +2042,19 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownWrites = ((addressBased || resources.UsesAddressTable()) && !readOnlyBda && !boundedAddressWrites) || resources.HasCopiedWrites();
     const PassAccess passAccess{passReads, boundedAddressWrites ? GuestRangeList(resources.AddressWrites()) : GuestRangeList(resources.GpuWrites()), passImages, passAttachments, unknownMemory, unknownWrites};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
+    if (recorder->Streams() > 1 && !unknownMemory && !capture) {
+        std::vector<Recorder::SectionObject> objects{{record.resources.get(), true}};
+        for (const auto& [image, written] : passImages) objects.push_back({image, written});
+        for (const auto& [image, written] : passAttachments) objects.push_back({image, written});
+        for (const auto view : record.targetViews) objects.push_back({view, true});
+        for (const auto& proxy : record.proxies) objects.push_back({proxy->Image(), true});
+        for (const auto& texture : resources.SampledTextures()) {
+            if (texture == nullptr) continue;
+            if (texture->ViewsStorageImage()) objects.push_back({texture->StorageSource()->Image(), false});
+            if (texture->SampledImage() != VK_NULL_HANDLE && (!texture->ViewsStorageImage() || texture->SampledImage() != texture->StorageSource()->Image())) objects.push_back({texture->SampledImage(), false});
+        }
+        recorder->DeclareSection(objects);
+    }
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;

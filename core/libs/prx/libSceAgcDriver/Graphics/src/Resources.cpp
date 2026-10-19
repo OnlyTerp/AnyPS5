@@ -392,6 +392,24 @@ void CommandBatch::Submit() {
             heapResolve = std::move(resolve.release);
         }
     }
+    const auto* recorder = Recorder::Active();
+    const auto queuePoints = recorder != nullptr && recorder->Device() == context.device ? recorder->OtherQueuePoints() : std::vector<Recorder::QueuePoint>{};
+    std::vector<VkSemaphore> waitSemaphores;
+    std::vector<std::uint64_t> waitValues;
+    for (const auto& point : queuePoints) {
+        waitSemaphores.push_back(point.timeline);
+        waitValues.push_back(point.value);
+    }
+    const std::vector<VkPipelineStageFlags> waitStages(waitSemaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    VkTimelineSemaphoreSubmitInfoKHR timelineWaits{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
+    if (!waitSemaphores.empty()) {
+        timelineWaits.waitSemaphoreValueCount = static_cast<std::uint32_t>(waitValues.size());
+        timelineWaits.pWaitSemaphoreValues = waitValues.data();
+        submission.pNext = &timelineWaits;
+        submission.waitSemaphoreCount = static_cast<std::uint32_t>(waitSemaphores.size());
+        submission.pWaitSemaphores = waitSemaphores.data();
+        submission.pWaitDstStageMask = waitStages.data();
+    }
     timing.Mark("command_end");
     Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
     pending = true;

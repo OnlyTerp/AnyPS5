@@ -176,6 +176,13 @@ void Driver::execute(const Submission& submission) {
         state = &queues[submission.queue];
     }
     auto& queue = *state;
+    if (submission.waitFree) {
+        if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->SeparateQueues()) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            localDevice->OrderAfterQueue(0);
+        }
+    }
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f execute serial=%llu queue=0x%x dwords=%zu\n", TraceMs(), static_cast<unsigned long long>(submission.serial), submission.queue, submission.commands.size());
 

@@ -303,6 +303,8 @@ struct VulkanDevice::State {
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
+    std::array<VkQueue, Graphics::MaxRecorderStreams> streamQueues{};
+    std::uint32_t streamQueueCount = 1;
     VkCommandPool pool = VK_NULL_HANDLE;
     void* window = nullptr;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
@@ -1086,6 +1088,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     devices.resize(count);
     VkPhysicalDevice selected = VK_NULL_HANDLE;
     std::uint32_t family = 0;
+    std::uint32_t familyQueues = 1;
     int selectedRank = -1;
     const char* requestedName = std::getenv("ANYPS5_GPU");
     if (requestedName != nullptr && *requestedName == '\0') requestedName = nullptr;
@@ -1149,6 +1152,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
                 }
                 selected = physical;
                 family = i;
+                familyQueues = queues[i].queueCount;
                 selectedRank = rank;
                 break;
             }
@@ -1545,11 +1549,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->spirvExtensions.push_back("SPV_EXT_mesh_shader");
     }
     const float priority = 1.0f;
+    std::array<float, Graphics::MaxRecorderStreams> priorities{};
+    priorities.fill(1.0f);
     VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queueInfo.queueFamilyIndex = family;
     queueInfo.queueCount = 1;
-    queueInfo.pQueuePriorities = &priority;
-    const float priorities[2]{1.0f, 1.0f};
+    queueInfo.pQueuePriorities = priorities.data();
     bool settleQueue = false;
     std::uint32_t settleFamily = family;
     std::uint32_t settleIndex = 0;
@@ -1567,7 +1572,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         getFamilies(selected, &families, queues.data());
         if (family < families && queues[family].queueCount >= 2) {
             queueInfo.queueCount = 2;
-            queueInfo.pQueuePriorities = priorities;
+            queueInfo.pQueuePriorities = priorities.data();
             settleQueue = true;
             settleIndex = 1;
         } else {
@@ -1646,7 +1651,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             settleQueue = queues[settleFamily].queueCount >= 2;
             if (settleQueue) {
                 queueInfos[1].queueCount = 2;
-                queueInfos[1].pQueuePriorities = priorities;
+                queueInfos[1].pQueuePriorities = priorities.data();
                 settleIndex = 1;
             }
         } else {
@@ -1960,6 +1965,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     }
     deviceInfo.pNext = &bdaFeatures;
+    static const bool separateQueues = std::getenv("APS5_NO_SEPARATE_QUEUES") == nullptr;
+    const std::uint32_t streamQueueCount = state->timelineSemaphores && separateQueues ? std::clamp<std::uint32_t>(familyQueues, 1, static_cast<std::uint32_t>(Graphics::MaxRecorderStreams)) : 1;
+    queueInfo.queueCount = std::max(queueInfo.queueCount, streamQueueCount);
+    queueInfos[0].queueCount = queueInfo.queueCount;
     auto shaderProfile = std::make_unique<const ShaderDeviceProfile>(buildTarget(), deviceInfo, state->properties.limits);
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
     state->shaderProfile = std::move(shaderProfile);
@@ -1984,6 +1993,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         }
     }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
+    state->streamQueueCount = streamQueueCount;
+    state->streamQueues[0] = state->queue;
+    for (std::uint32_t index = 1; index < state->streamQueueCount; ++index) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, index, &state->streamQueues[index]);
     state->queueFamily = family;
     if (settleQueue) {
         state->settleFamily = settleFamily;
@@ -2000,7 +2012,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         Graphics::DeviceLostOwner() = state.get();
         state->deviceLostHook = true;
     }
-    APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
+    APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u queues=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family, state->streamQueueCount);
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = family;
@@ -2280,6 +2292,22 @@ bool VulkanDevice::RecordedWritesSettled(std::uint64_t address, std::size_t byte
     return Graphics::Recorder::PendingCompletionLabels() == 0 || !recorder.CompletionLabelIn(address, bytes);
 }
 
+bool VulkanDevice::SeparateQueues() const {
+    return state->recorder && state->recorder->Streams() > 1;
+}
+
+void VulkanDevice::OrderAfterLabel(std::uint64_t address, std::size_t bytes) {
+    if (state->recorder) state->recorder->OrderAfterLabel(address, bytes);
+}
+
+void VulkanDevice::OrderAfterValue(std::uint64_t address, std::size_t bytes) {
+    if (state->recorder) state->recorder->OrderAfterValue(address, bytes);
+}
+
+void VulkanDevice::OrderAfterQueue(std::uint32_t queue) {
+    if (state->recorder) state->recorder->OrderAfterQueue(queue);
+}
+
 bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) const {
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + bytes}}};
     if (Graphics::StorageTexture::AnyPendingOverlaps(range) || Graphics::AnyShadowedOverlaps(range) || state->CopiedWriterOverlaps(address, bytes)) return true;
@@ -2479,6 +2507,8 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
             auto seed = std::make_shared<Graphics::Buffer>(context, 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             std::memcpy(seed->Bytes().data(), pattern.data(), 16);
             recorder.Keep(seed);
+            const std::array<Graphics::Recorder::SectionObject, 1> written{{{patternBuffer.get(), true}}};
+            recorder.DeclareSection(written);
             const auto chain = recorder.Commands();
             const auto copyBuffer = context.Resolved(&Graphics::DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
             const VkBufferCopy first{0, 0, 16};
@@ -2498,6 +2528,8 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     }
     // A queued label store over the range lands before the fill (program order).
     recorder.FlushStoresOverlapping(address, bytes);
+    const std::array<Graphics::Recorder::SectionObject, 1> patternRead{{{patternBuffer.get(), false}}};
+    recorder.DeclareSection(std::span(patternRead).first(patternBuffer != nullptr ? 1 : 0));
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
     const auto timing = recorder.BeginGpuTiming(CommandClass::Fill);
@@ -2760,6 +2792,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     // A queued label store in either range lands before the transfer reads or writes it.
     recorder.FlushStoresOverlapping(source, bytes);
     recorder.FlushStoresOverlapping(destination, bytes);
+    recorder.DeclareSection({});
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
     // The class range covers the barriers too; the program-keyed range inside it is the transfer.
@@ -3434,6 +3467,23 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     submit.pCommandBuffers = &commands;
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &rendered;
+    const auto queuePoints = state->recorder ? state->recorder->OtherQueuePoints() : std::vector<Graphics::Recorder::QueuePoint>{};
+    std::vector<VkSemaphore> waitSemaphores;
+    std::vector<std::uint64_t> waitValues;
+    for (const auto& point : queuePoints) {
+        waitSemaphores.push_back(point.timeline);
+        waitValues.push_back(point.value);
+    }
+    const std::vector<VkPipelineStageFlags> waitStages(waitSemaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    VkTimelineSemaphoreSubmitInfoKHR timelineWaits{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
+    if (!waitSemaphores.empty()) {
+        timelineWaits.waitSemaphoreValueCount = static_cast<std::uint32_t>(waitValues.size());
+        timelineWaits.pWaitSemaphoreValues = waitValues.data();
+        submit.pNext = &timelineWaits;
+        submit.waitSemaphoreCount = static_cast<std::uint32_t>(waitSemaphores.size());
+        submit.pWaitSemaphores = waitSemaphores.data();
+        submit.pWaitDstStageMask = waitStages.data();
+    }
     timing.Mark("command_record_scale");
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
@@ -3778,6 +3828,8 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.settlePool = state->settlePool;
     context.settleFamily = state->settleFamily;
     context.settleQueueMutex = &state->settleQueueMutex;
+    context.streamQueues = state->streamQueues;
+    context.streamQueueCount = state->streamQueueCount;
     context.recorder = state->recorder.get();
     context.descriptorCache = state->descriptorCache.get();
     context.vertexInputs = state->vertexInputs.get();
@@ -3846,17 +3898,15 @@ void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     Graphics::RunColorMetadataPass(readyContext(), pass);
 }
 
-<<<<<<< HEAD
 void VulkanDevice::DepthExpandPass(const Graphics::DepthExpandPass& pass) {
     Graphics::RunDepthExpandPass(graphicsContext(), pass);
-=======
+    }
 bool VulkanDevice::PrepareDrawPipelines(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) {
     PerformanceTimer timing("Vulkan.DrawPipelinePreparation");
     const auto context = graphicsContext();
     if (!context.graphicsPipelineLibrary || context.descriptorCache == nullptr) return false;
     const auto layouts = Graphics::DescribeSetLayouts(context, shaders);
     return Graphics::Pipeline::Prebuild(context, graphics, Graphics::VertexInputLayout{}, layouts.View(), shaders);
->>>>>>> fork/arch/d-unlock-pipeline-and-present-clean
 }
 
 bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders) {
@@ -4767,6 +4817,20 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         if (const auto unserved = table->Expect(context, recorder, record.shader->program->deviceImages)) Graphics::Require(false, "a dispatch recorded without the driver's expectation cannot take the CPU table path: " + *unserved);
         table->Prepare(context, recorder, programs);
     }
+    const auto workgroupDwords = record.shader->program->workgroupMemoryDwords;
+    auto workgroupMemory = workgroupDwords != 0 ? state->WorkgroupMemoryFor(context, record.x, record.y, record.z, workgroupDwords) : nullptr;
+    if (recorder.Streams() > 1 && !resources.HoldsLease() && !resources.UsesAddressTable()) {
+        std::vector<Graphics::Recorder::SectionObject> objects{{record.resources.get(), true}};
+        if (record.bindings != nullptr) objects.push_back({record.bindings.get(), true});
+        if (workgroupMemory != nullptr) objects.push_back({workgroupMemory.get(), true});
+        for (const auto& [image, written] : resources.StorageImages()) objects.push_back({image, written});
+        for (const auto& texture : resources.SampledTextures()) {
+            if (texture == nullptr) continue;
+            if (texture->ViewsStorageImage()) objects.push_back({texture->StorageSource()->Image(), false});
+            if (texture->SampledImage() != VK_NULL_HANDLE && (!texture->ViewsStorageImage() || texture->SampledImage() != texture->StorageSource()->Image())) objects.push_back({texture->SampledImage(), false});
+        }
+        recorder.DeclareSection(objects);
+    }
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
     recordStep(PhaseRecordCommands);
@@ -4840,10 +4904,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (record.bindings != nullptr) Graphics::Require(record.bindings->allocation.set != VK_NULL_HANDLE, "dispatch overlay has no descriptor set");
     if (record.bindings != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, 0, 1, &record.bindings->allocation.set, 0, nullptr);
     else resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
-    if (const auto dwords = record.shader->program->workgroupMemoryDwords; dwords != 0) {
-        auto memory = state->WorkgroupMemoryFor(context, record.x, record.y, record.z, dwords);
-        context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::WorkgroupMemoryDescriptorSet, 1, &memory->set, 0, nullptr);
-        recorder.Keep(std::move(memory));
+    if (workgroupMemory != nullptr) {
+        context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::WorkgroupMemoryDescriptorSet, 1, &workgroupMemory->set, 0, nullptr);
+        recorder.Keep(std::move(workgroupMemory));
     }
     if (record.pushStages != 0) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
