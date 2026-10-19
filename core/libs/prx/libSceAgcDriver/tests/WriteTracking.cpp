@@ -11,11 +11,16 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -54,6 +59,136 @@ void* AllocateWatched(std::size_t bytes, bool crossLeaf = false) {
 #endif
     Require(Watched(reinterpret_cast<std::uint64_t>(block), bytes), "the test block is not watched");
     return block;
+}
+
+constexpr std::size_t LeafSpan = std::size_t{1} << 32;
+constexpr std::size_t LeafBytes = 3 * (LeafSpan / Block) * sizeof(std::uint32_t);
+
+void ReleaseWatched(void* memory, std::size_t bytes) {
+#ifdef _WIN32
+    GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+#else
+    GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory, bytes);
+    munmap(memory, bytes);
+#endif
+}
+
+#ifdef _WIN32
+void* ArenaBlocksAt(std::uintptr_t address, std::size_t bytes) {
+    void* memory = GuestArena::GuestArenaAllocateAtOrAbove_nid_postfix(address, bytes, Block);
+    Require(memory != nullptr, "cannot allocate arena memory");
+    if (reinterpret_cast<std::uintptr_t>(memory) != address) {
+        GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+        return nullptr;
+    }
+    GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes);
+    return memory;
+}
+#endif
+
+void CheckStampLeaves() {
+    constexpr std::size_t Regions = 16;
+    const auto before = StampTableBytes();
+    std::vector<void*> regions;
+#ifdef _WIN32
+    std::uintptr_t arenaBase = 0;
+    std::size_t arenaBytes = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
+    Require(arenaBytes >= Regions * LeafSpan, "the arena is too small for a region per leaf");
+    for (std::size_t region = 0; region < Regions; ++region) {
+        void* memory = GuestArena::GuestArenaAllocateAtOrAbove_nid_postfix(arenaBase + region * (arenaBytes / Regions), 2 * Block, Block);
+        Require(memory != nullptr, "cannot allocate a scattered region");
+        GuestArena::GuestArenaCommit_nid_postfix(memory, 2 * Block, PAGE_READWRITE, 2 * Block);
+        regions.push_back(memory);
+    }
+    const auto flatBytes = 3 * (arenaBytes / Block + 1) * sizeof(std::uint32_t);
+#else
+    for (std::size_t region = 0; region < Regions; ++region) regions.push_back(AllocateWatched(2 * Block, true));
+#endif
+    for (void* memory : regions) Require(MarkWritten(reinterpret_cast<std::uint64_t>(memory), 2 * Block) != 0, "a scattered stamp was not taken");
+    const auto after = StampTableBytes();
+#ifdef _WIN32
+    Require(after <= flatBytes / 4, "the stamp tables hold " + std::to_string(after >> 10) + " KiB, not a few leaves of the " + std::to_string(flatBytes >> 20) + " MiB flat tables");
+#endif
+    Require(after > before && after - before <= 2 * Regions * LeafBytes, "stamping " + std::to_string(Regions) + " scattered regions grew the stamp tables by " + std::to_string((after - before) >> 10) + " KiB, more than two leaves each");
+    std::cout << "stamping " << Regions << " scattered regions grew the stamp tables by " << ((after - before) >> 10) << " KiB to " << (after >> 10) << " KiB\n";
+    for (void* memory : regions) ReleaseWatched(memory, 2 * Block);
+}
+
+void CheckStampEquivalence() {
+    std::vector<std::pair<std::uint64_t, std::size_t>> areas;
+#ifdef _WIN32
+    std::uintptr_t arenaBase = 0;
+    std::size_t arenaBytes = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
+    for (std::size_t leaf = 1; areas.empty() && (leaf + 1) * LeafSpan < arenaBytes; ++leaf) {
+        if (void* memory = ArenaBlocksAt(arenaBase + leaf * LeafSpan - Block, 2 * Block)) areas.emplace_back(reinterpret_cast<std::uint64_t>(memory), 2 * Block);
+    }
+    Require(!areas.empty(), "no leaf boundary of the arena is free");
+    const auto last = (arenaBase + arenaBytes - 1) & ~static_cast<std::uintptr_t>(Block - 1);
+    void* lastBlock = ArenaBlocksAt(last, arenaBase + arenaBytes - last);
+    Require(lastBlock != nullptr, "the arena's last block is not free");
+    areas.emplace_back(reinterpret_cast<std::uint64_t>(lastBlock), arenaBase + arenaBytes - last);
+    areas.emplace_back(reinterpret_cast<std::uint64_t>(AllocateWatched(4 * Block)), 4 * Block);
+#else
+    areas.emplace_back(reinterpret_cast<std::uint64_t>(AllocateWatched(2 * Block, true)), 2 * Block);
+    Require((areas.back().first + Block) % LeafSpan == 0, "the leaf-boundary block does not end at a leaf boundary");
+    areas.emplace_back(reinterpret_cast<std::uint64_t>(AllocateWatched(4 * Block)), 4 * Block);
+#endif
+    std::map<std::uint64_t, std::uint64_t> flat;
+    std::vector<std::uint64_t> generations;
+    std::mt19937_64 random(5);
+    const auto pick = [&](std::uint64_t& address, std::size_t& bytes) {
+        const auto& area = areas[random() % areas.size()];
+        const auto offset = static_cast<std::size_t>(random() % area.second);
+        address = area.first + offset;
+        bytes = 1 + static_cast<std::size_t>(random() % (area.second - offset));
+    };
+    for (int step = 0; step < 400; ++step) {
+        std::uint64_t address = 0;
+        std::size_t bytes = 0;
+        pick(address, bytes);
+        const auto generation = MarkWritten(address, bytes);
+        Require(generation != 0, "a stamp of watched memory was not taken");
+        for (auto block = address & ~static_cast<std::uint64_t>(Block - 1); block < address + bytes; block += Block) flat[block] = generation;
+        generations.push_back(generation);
+        pick(address, bytes);
+        const auto since = generations[random() % generations.size()];
+        bool newer = false;
+        std::uint64_t newest = 0;
+        for (auto block = address & ~static_cast<std::uint64_t>(Block - 1); block < address + bytes; block += Block) {
+            const auto found = flat.find(block);
+            const auto stamp = found == flat.end() ? 0 : found->second;
+            newer = newer || stamp > since;
+            newest = std::max(newest, stamp);
+        }
+        Require(WrittenSince(address, bytes, since) == newer, "step " + std::to_string(step) + ": WrittenSince differs from the flat stamps");
+        if (newest != 0) Require(NewestStamp(address, bytes) == newest, "step " + std::to_string(step) + ": NewestStamp differs from the flat stamps");
+    }
+    std::cout << "400 stamps and reads over " << areas.size() << " areas, around a leaf boundary" << (areas.size() > 2 ? " and at the arena's last block" : "") << ", match flat stamps\n";
+    for (const auto& [address, bytes] : areas) ReleaseWatched(reinterpret_cast<void*>(address), bytes);
+}
+
+int Bench() {
+    constexpr std::size_t Blocks = 256;
+    constexpr int Stamps = 20000;
+    constexpr int Reads = 200000;
+    void* memory = AllocateWatched(Blocks * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    for (int round = 0; round < 3; ++round) {
+        auto start = std::chrono::steady_clock::now();
+        std::uint64_t generation = 0;
+        for (int stamp = 0; stamp < Stamps; ++stamp) generation = MarkWritten(base + static_cast<std::uint64_t>(stamp % Blocks) * Block + 64, 4);
+        const auto stampNs = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / Stamps;
+        start = std::chrono::steady_clock::now();
+        std::size_t newer = 0;
+        for (int read = 0; read < Reads; ++read) newer += WrittenSince(base, Blocks * Block, generation) ? 1u : 0u;
+        const auto readNs = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / Reads;
+        std::printf("bench round %d: MarkWritten of one block %.1f ns; WrittenSince over %zu blocks %.1f ns (%.2f ns per block, %zu newer)\n", round, stampNs, Blocks, readNs, readNs / Blocks, newer);
+    }
+    ReleaseWatched(memory, Blocks * Block);
+    return 0;
 }
 
 void CheckSharedBlock() {
@@ -446,6 +581,58 @@ void CheckCoarseRuns() {
 }
 
 #ifdef _WIN32
+std::size_t CommittedBytes(const TableReservation& table) {
+    const auto begin = reinterpret_cast<std::uintptr_t>(table.base);
+    const auto end = begin + table.bytes;
+    std::size_t committed = 0;
+    for (auto cursor = begin; cursor < end;) {
+        MEMORY_BASIC_INFORMATION memory{};
+        Require(VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) == sizeof(memory) && memory.RegionSize != 0, "cannot query a guest memory table");
+        const auto regionEnd = std::min<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize, end);
+        if (memory.State == MEM_COMMIT) committed += regionEnd - cursor;
+        cursor = regionEnd;
+    }
+    return committed;
+}
+
+void CheckTableCommitCharge() {
+    constexpr std::size_t Regions = 32;
+    constexpr std::size_t TablePage = 65536;
+    std::uintptr_t arenaBase = 0;
+    std::size_t arenaBytes = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
+    Require(arenaBytes >= Regions * 1024 * Block, "the arena is too small for scattered regions");
+    std::vector<void*> regions;
+    for (std::size_t region = 0; region < Regions; ++region) {
+        void* memory = GuestArena::GuestArenaAllocateAtOrAbove_nid_postfix(arenaBase + region * (arenaBytes / Regions), Block, Block);
+        Require(memory != nullptr, "cannot allocate a scattered region");
+        GuestArena::GuestArenaCommit_nid_postfix(memory, Block, PAGE_READWRITE, Block);
+        regions.push_back(memory);
+    }
+    for (void* memory : regions) {
+        const auto address = reinterpret_cast<std::uint64_t>(memory);
+        Require(Accessible(memory, Block, true), "a scattered region is not accessible");
+        std::memset(memory, 0x5a, Block);
+        MarkWritten(address + 16, 4);
+        static_cast<void>(CollectWritesUncached(address, Block));
+    }
+    const auto tables = TableReservations();
+    Require(!tables.empty(), "the page-state table is missing");
+    std::size_t checked = 0;
+    for (const auto& table : tables) {
+        if (table.bytes <= 8 * Regions * TablePage) continue;
+        const auto committed = CommittedBytes(table);
+        Require(committed <= 4 * Regions * TablePage, "a guest memory table of " + std::to_string(table.bytes >> 20) + " MiB has " + std::to_string(committed >> 10) + " KiB committed after " + std::to_string(Regions) + " scattered regions");
+        std::cout << "a guest memory table of " << (table.bytes >> 20) << " MiB has " << (committed >> 10) << " KiB committed after " << Regions << " scattered regions\n";
+        ++checked;
+    }
+    Require(checked != 0, "no guest memory table is large enough to check");
+    for (void* memory : regions) {
+        GuestArena::GuestArenaReset_nid_postfix(memory, Block);
+        GuestArena::GuestArenaRelease_nid_postfix(memory, Block);
+    }
+}
+
 void CheckDeferredSharedImports() {
     constexpr std::size_t bytes = 4 * Block;
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
@@ -1184,17 +1371,23 @@ void CheckAdoptLatestEpoch() {
     Require(keptOwn, "adopting the newest collect epoch moved a thread off its own");
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";
             return 77;
         }
+        if (argc > 1 && std::string_view(argv[1]) == "--bench") return Bench();
 #ifdef _WIN32
         if (std::wstring_view(GetCommandLineW()).ends_with(HostHoleMode)) {
             CheckHostHole();
             return 0;
         }
+#endif
+        CheckStampLeaves();
+        CheckStampEquivalence();
+#ifdef _WIN32
+        CheckTableCommitCharge();
 #endif
         CheckSharedBlock();
         CheckStoredAllSince();

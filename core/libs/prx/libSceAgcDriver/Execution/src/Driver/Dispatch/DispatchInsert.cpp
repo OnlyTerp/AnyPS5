@@ -90,55 +90,24 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
             entryCounters.dataLeavesMismatched += dataCounts.mismatched;
             entryCounters.dataLeavesAliased += dataCounts.aliased;
             attachVariant = fresh;
-            const auto found = dispatchCache.find(key);
-            if (found == dispatchCache.end()) {
-                auto created = std::make_shared<DispatchEntry>();
-                created->touched = dispatchCacheHits;
-                accountVariant(*fresh, true);
-                created->variants.push_back(std::move(fresh));
-                dispatchOrder.push_front(key);
-                created->order = dispatchOrder.begin();
-                dispatchCache.emplace(key, std::move(created));
-            } else if (found->second != missedEntry && !found->second->variants.empty() && found->second->variants.front()->runs == fresh->runs && SameCapturedWords(found->second->variants.front()->words, found->second->variants.front()->shared, fresh->words, fresh->shared)) {
+            const auto found = dispatchCache.Find(key);
+            if (!dispatchCache.Admits(*fresh)) {
+                ++entryCounters.variantsOverBudget;
+            } else if (found == nullptr) {
+                dispatchCache.Insert(key, std::move(fresh), dispatchCacheHits);
+            } else if (found != missedEntry && !found->variants.empty() && found->variants.front()->runs == fresh->runs && SameCapturedWords(found->variants.front()->words, found->variants.front()->shared, fresh->words, fresh->shared)) {
 
-                attachVariant = found->second->variants.front();
+                attachVariant = found->variants.front();
             } else {
-
-                const auto& old = found->second;
-                auto replacement = std::make_shared<DispatchEntry>();
-                replacement->variants.reserve(dispatchVariants());
-                accountVariant(*fresh, true);
-                replacement->variants.push_back(std::move(fresh));
-                for (const auto& kept : old->variants) {
-                    if (replacement->variants.size() < dispatchVariants()) {
-                        replacement->variants.push_back(kept);
-                    } else {
-                        accountVariant(*kept, false);
-                        ++entryCounters.variantsEvicted;
-                    }
-                }
+                entryCounters.variantsEvicted += dispatchCache.Prepend(key, std::move(fresh), dispatchVariants(), dispatchCacheHits);
                 ++entryCounters.variantsInserted;
-                replacement->touched = dispatchCacheHits;
-                replacement->order = old->order;
-                dispatchOrder.splice(dispatchOrder.begin(), dispatchOrder, replacement->order);
-                found->second = std::move(replacement);
             }
 
             static const bool lru = std::getenv("APS5_NO_DISPATCH_LRU") == nullptr;
-            const auto over = [&] { return dispatchCache.size() > dispatchCacheEntries() || (dispatchCache.size() > 1 && dispatchCacheVariantBytes > DispatchCacheBytes()); };
-            if (over()) {
-                if (lru) {
-                    while (over()) {
-                        eraseDispatchEntry(dispatchCache.find(dispatchOrder.back()));
-                        ++dispatchCacheEvictions;
-                    }
-                } else {
-                    dispatchCacheEvictions += dispatchCache.size();
-                    dispatchCache.clear();
-                    dispatchOrder.clear();
-                    dispatchCacheVariants = 0;
-                    dispatchCacheVariantBytes = 0;
-                }
+            if (lru) {
+                dispatchCacheEvictions += dispatchCache.Trim(key);
+            } else if (dispatchCache.OverLimits()) {
+                dispatchCacheEvictions += dispatchCache.Clear();
             }
         } else {
             ++entryCounters.unstable;

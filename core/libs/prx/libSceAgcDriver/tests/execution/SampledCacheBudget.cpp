@@ -16,6 +16,14 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#else
+#include <malloc.h>
+#endif
 #endif
 #include <array>
 #include <chrono>
@@ -44,7 +52,6 @@ constexpr std::size_t SurfaceBytes = std::size_t{Side} * Side * 4u;
 constexpr std::size_t Surfaces = 12;
 constexpr std::size_t BlockBytes = SurfaceBytes * Surfaces;
 constexpr std::size_t RegistrationGapBytes = 65536;
-constexpr std::size_t AllocationBytes = BlockBytes + RegistrationGapBytes;
 constexpr std::uint64_t Budget = 1ull << 20u;
 constexpr std::uint64_t Ceiling = Budget + Budget / 4u;
 
@@ -165,21 +172,21 @@ private:
 
 class Block {
 public:
-    explicit Block(const Context& context) : context(context) {
+    explicit Block(const Context& context, std::size_t surfaceBytes = SurfaceBytes, std::size_t surfaces = Surfaces) : context(context), surfaceBytes(surfaceBytes), blockBytes(surfaceBytes * surfaces) {
 #ifdef _WIN32
-        memory = VirtualAlloc(nullptr, AllocationBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        memory = VirtualAlloc(nullptr, blockBytes + RegistrationGapBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 #else
-        memory = std::aligned_alloc(65536, AllocationBytes);
+        memory = std::aligned_alloc(65536, blockBytes + RegistrationGapBytes);
 #endif
         Require(memory != nullptr, "cannot allocate the texture block");
-        std::memset(memory, 0x5a, BlockBytes);
-        GuestAllocations::Mutation().Add(memory, BlockBytes, true, true, true);
+        std::memset(memory, 0x5a, blockBytes);
+        GuestAllocations::Mutation().Add(memory, blockBytes, true, true, true);
     }
 
     ~Block() {
         ClearCachedTextures(context.device);
         GuestAllocations::Mutation().Remove(memory);
-        HostImportFor(context, Surface(0), BlockBytes);
+        HostImportFor(context, Surface(0), blockBytes);
 #ifdef _WIN32
         VirtualFree(memory, 0, MEM_RELEASE);
 #else
@@ -187,10 +194,12 @@ public:
 #endif
     }
 
-    std::uint64_t Surface(std::size_t surface) const { return reinterpret_cast<std::uint64_t>(memory) + surface * SurfaceBytes; }
+    std::uint64_t Surface(std::size_t surface) const { return reinterpret_cast<std::uint64_t>(memory) + surface * surfaceBytes; }
 
 private:
     const Context& context;
+    std::size_t surfaceBytes;
+    std::size_t blockBytes;
     void* memory = nullptr;
 };
 
@@ -712,12 +721,103 @@ void storageMemoryTests(Context context) {
     std::printf("reported heap budget %llu MiB with %llu MiB in use: storage image cache budget %llu MiB\n", static_cast<unsigned long long>(ReportedBudget >> 20u), static_cast<unsigned long long>(PressedUsage >> 20u), static_cast<unsigned long long>(pressed >> 20u));
 }
 
+std::uint64_t HeapBytesInUse() {
+#ifdef _WIN32
+    HEAP_SUMMARY summary{};
+    summary.cb = sizeof(summary);
+    Require(HeapSummary(GetProcessHeap(), 0, &summary) != FALSE, "cannot read the process heap summary");
+    return summary.cbAllocated;
+#elif defined(__APPLE__)
+    malloc_statistics_t statistics{};
+    malloc_zone_statistics(nullptr, &statistics);
+    return statistics.size_in_use;
+#else
+    const auto information = mallinfo2();
+    return information.uordblks + information.hblkhd;
+#endif
+}
+
+void digestTests() {
+    namespace GuestMemory = AgcDriver::GuestMemory;
+#ifdef _WIN32
+    constexpr std::size_t page = 4096;
+    auto* block = static_cast<std::byte*>(VirtualAlloc(nullptr, 4 * page, MEM_RESERVE, PAGE_READWRITE));
+    Require(block != nullptr, "cannot reserve the digest test pages");
+    for (const std::size_t index : {0u, 1u, 3u}) Require(VirtualAlloc(block + index * page, page, MEM_COMMIT, PAGE_READWRITE) != nullptr, "cannot commit a digest test page");
+#else
+    const auto page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    auto* block = static_cast<std::byte*>(mmap(nullptr, 4 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    Require(block != MAP_FAILED, "cannot map the digest test pages");
+    Require(munmap(block + 2 * page, page) == 0, "cannot unmap the digest test's third page");
+#endif
+    for (const std::size_t index : {0u, 1u, 3u}) {
+        for (std::size_t offset = 0; offset < page; ++offset) block[index * page + offset] = static_cast<std::byte>((index * 131u + offset * 7u) & 0xffu);
+    }
+    const auto base = reinterpret_cast<std::uint64_t>(block);
+    std::vector<std::byte> read(4 * page);
+    GuestMemory::ReadCommitted(base, read);
+    Require(GuestMemory::DigestCommitted(base, read.size()) == GuestMemory::Digest(read), "the digest of partly committed memory is not the digest of its committed read");
+    const auto odd = 2 * page - 3u;
+    const std::span<const std::byte> committed(read.data(), odd);
+    Require(GuestMemory::DigestCommitted(base, odd) == GuestMemory::Digest(committed), "the digest of committed memory is not the digest of its bytes");
+    for (const std::size_t offset : {std::size_t{0}, page + 5u, odd - 1u, 4 * page - 1u}) {
+        block[offset] ^= std::byte{1};
+        const bool caught = GuestMemory::DigestCommitted(base, read.size()) != GuestMemory::Digest(read) && (offset >= odd || GuestMemory::DigestCommitted(base, odd) != GuestMemory::Digest(committed));
+        block[offset] ^= std::byte{1};
+        Require(caught, "a byte changed at offset " + std::to_string(offset) + " kept the digest");
+    }
+    Require(GuestMemory::DigestCommitted(base, read.size()) == GuestMemory::Digest(read), "restoring the changed bytes did not restore the digest");
+#ifdef _WIN32
+    VirtualFree(block, 0, MEM_RELEASE);
+#else
+    munmap(block, 2 * page);
+    munmap(block + 3 * page, page);
+#endif
+}
+
+void snapshotMemoryTests(Context context) {
+    context.memoryProperties2 = &ReportBudget;
+    const bool digests = std::getenv("APS5_SAMPLED_DIGEST") != nullptr;
+    constexpr std::uint32_t LargeSide = 1024;
+    constexpr std::size_t LargeSurfaceBytes = std::size_t{LargeSide} * LargeSide * 4u;
+    constexpr std::size_t Cached = 8;
+    Block block(context, LargeSurfaceBytes, Cached + 1u);
+    Require(DescribeSurface(Resource(block.Surface(0), LargeSide)).guestBytes == LargeSurfaceBytes, "the large test surface does not take the bytes the test plans for");
+    Require(!Sampled(context, block.Surface(Cached), LargeSide)->ViewsStorageImage(), "a large sampled texture outside host-imported memory is not a snapshot");
+    ClearCachedTextures(context.device);
+    const auto before = HeapBytesInUse();
+    std::vector<std::shared_ptr<Texture>> textures;
+    for (std::size_t surface = 0; surface < Cached; ++surface) textures.push_back(Sampled(context, block.Surface(surface), LargeSide));
+    const auto after = HeapBytesInUse();
+    const auto usage = TextureCacheUsage();
+    Require(usage.sampledEntries == Cached, "the sampled texture cache did not keep the " + std::to_string(Cached) + " large snapshots");
+    const auto grown = after > before ? after - before : 0u;
+    const auto copies = digests ? 0u : Cached * LargeSurfaceBytes;
+    Require(usage.snapshotHostBytes == copies, "the sampled texture cache counts " + std::to_string(usage.snapshotHostBytes >> 10u) + " KiB of host snapshot copies, not " + std::to_string(copies >> 10u) + " KiB");
+    if (digests) Require(grown < LargeSurfaceBytes, std::to_string(Cached) + " cached snapshots of " + std::to_string(LargeSurfaceBytes >> 20u) + " MiB surfaces grew the heap by " + std::to_string(grown >> 10u) + " KiB: the cache keeps a copy of their guest bytes");
+    else Require(grown >= copies, std::to_string(Cached) + " cached snapshots of " + std::to_string(LargeSurfaceBytes >> 20u) + " MiB surfaces grew the heap by " + std::to_string(grown >> 10u) + " KiB, less than the copies of their guest bytes the cache keeps");
+    auto* bytes = reinterpret_cast<std::byte*>(block.Surface(0));
+    Require(Sampled(context, block.Surface(0), LargeSide) == textures.front(), "an unchanged snapshot was made again");
+    for (const std::size_t offset : {std::size_t{0}, LargeSurfaceBytes / 2u + 3u, LargeSurfaceBytes - 1u}) {
+        bytes[offset] ^= std::byte{0x10};
+        auto changed = Sampled(context, block.Surface(0), LargeSide);
+        Require(changed != textures.front(), "a byte changed at offset " + std::to_string(offset) + " of a cached snapshot was not caught");
+        textures.front() = std::move(changed);
+        Require(Sampled(context, block.Surface(0), LargeSide) == textures.front(), "the snapshot made after a changed byte was made again");
+    }
+    std::printf("%zu cached snapshots of %zu MiB surfaces (%s) grew the heap by %llu KiB, %llu KiB of them host snapshot copies\n", Cached, LargeSurfaceBytes >> 20u, digests ? "digests" : "copies", static_cast<unsigned long long>(grown >> 10u), static_cast<unsigned long long>(usage.snapshotHostBytes >> 10u));
+    textures.clear();
+    ClearCachedTextures(context.device);
+    Require(TextureCacheUsage().snapshotHostBytes == 0, "clearing the sampled texture cache left host snapshot copies counted");
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
-        const bool memory = argc > 1 && std::string(argv[1]) == "memory";
         const std::string mode = argc > 1 ? argv[1] : "";
+        const bool snapshots = mode == "snapshot-memory";
+        const bool memory = mode == "memory" || snapshots;
         const bool resources = mode == "resource-admission" || mode == "resource-oversized" || mode == "resource-clear";
         const bool disableStorageImageMultisample = mode == "without-storage-image-multisample";
 #ifdef _WIN32
@@ -725,6 +825,7 @@ int main(int argc, char** argv) {
 #else
         if (!memory) setenv("APS5_TEXTURE_CACHE_MIB", "1", 1);
 #endif
+        if (snapshots) digestTests();
         std::unique_ptr<Device> device;
         try {
             device = std::make_unique<Device>(!disableStorageImageMultisample);
@@ -755,6 +856,12 @@ int main(int argc, char** argv) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             if (!resourceCacheTests(context, mode)) return VulkanTestSkipped;
             std::puts("resource cache tests passed");
+            return 0;
+        }
+        if (snapshots) {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            snapshotMemoryTests(context);
+            std::puts("sampled texture snapshot memory tests passed");
             return 0;
         }
         if (memory) {
