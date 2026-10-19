@@ -125,7 +125,7 @@ void inactiveVertexPointSizeTests() {
         queue.context[0x207] = 0x01210000;
         return queue;
     };
-    for (const auto primitive : {2u, 4u, 5u, 6u, 7u, 17u, 21u}) {
+    for (const auto primitive : {2u, 4u, 5u, 6u, 7u, 17u, 19u, 21u}) {
         auto queue = pointSizeState();
         queue.userConfig[0x242] = primitive;
         for (const auto raster : {0u, 0x240u, 0x248u}) {
@@ -3491,6 +3491,9 @@ void multisampleTests() {
     queue.context[0x2f8] = 0x00200002;
     for (std::uint32_t pixel = 0; pixel < 4; ++pixel) queue.context[0x2fe + pixel * 4u] = 0x622ae6aeu;
     expectFailure([&] { DecodeColorMetadataPass(queue); }, "differs from the rasterizer's");
+    queue.context[0x292] &= ~1u;
+    pass = DecodeColorMetadataPass(queue);
+    Require(pass.has_value() && pass->mode == ColorMetadataPass::Mode::Resolve && pass->source.has_value() && pass->source->samples == 2 && pass->targets.size() == 1, "a CB resolve with MSAA_ENABLE off did not take its sample count from the source target despite a stale PA_SC_AA_CONFIG");
     queue = rasterizedResolve;
     std::vector<std::byte> resolvedBlock(2u * 65536u);
     const auto resolvedAddress = (reinterpret_cast<std::uintptr_t>(resolvedBlock.data()) + 65535u) / 65536u * 65536u;
@@ -4020,6 +4023,57 @@ void DepthRemapTests() {
     floating.depthWrite = true;
     AgcDriver::Graphics::ApplyDepthRemap(remapping, floating);
     Require(floating.depthRemap.mode == 1 && floating.viewport.minDepth == 0 && floating.viewport.maxDepth == 1 && floating.depthClamp, "a written float depth target refused clipped clamp bounds");
+}
+
+void UnusedViewportDepthTests() {
+    auto queue = makeState();
+    queue.context[0x204] = 0;
+    queue.context[0x113] = std::bit_cast<std::uint32_t>(1.0f);
+    queue.context[0x114] = 0;
+    const auto decoded = AgcDriver::Graphics::DecodeState(queue);
+    Require(!decoded.depth && decoded.viewport.minDepth == -1 && decoded.viewport.maxDepth == 1, "unused depth fixture changed");
+    AgcDriver::Graphics::Context context{};
+    context.limits.maxViewportDimensions[0] = context.limits.maxViewportDimensions[1] = 16384;
+    context.limits.viewportBoundsRange[0] = -32768;
+    context.limits.viewportBoundsRange[1] = 32767;
+    ShaderRecompiler::ShaderPixelStageInfo pixel{};
+    pixel.posX = pixel.posY = pixel.posW = true;
+    auto color = decoded;
+    AgcDriver::Graphics::NormalizeUnusedViewportDepth(color, pixel);
+    AgcDriver::Graphics::ValidateViewport(context, color.viewport);
+    Require(color.viewport.minDepth == 0 && color.viewport.maxDepth == 1, "unused viewport depth is not representable");
+    AgcDriver::Graphics::Context remapping{};
+    remapping.depthClamp = true;
+    const auto normalized = color;
+    AgcDriver::Graphics::ApplyDepthRemap(remapping, color);
+    Require(color.depthRemap.mode == 0 && color.viewport.minDepth == 0 && color.viewport.maxDepth == 1 && color.negativeOneToOne == normalized.negativeOneToOne && color.depthClamp == normalized.depthClamp, "the depth remap acted on a normalized viewport");
+    Require(color.viewport.x == decoded.viewport.x && color.viewport.y == decoded.viewport.y && color.viewport.width == decoded.viewport.width && color.viewport.height == decoded.viewport.height && color.negativeOneToOne == decoded.negativeOneToOne && color.depthClamp == decoded.depthClamp, "unused depth changed coverage or clipping");
+    auto observed = decoded;
+    pixel.posZ = true;
+    AgcDriver::Graphics::NormalizeUnusedViewportDepth(observed, pixel);
+    Require(observed.viewport.minDepth == -1, "fragment position depth was changed");
+    expectFailure([&] { AgcDriver::Graphics::ValidateViewport(context, observed.viewport); }, "viewport depth outside");
+    pixel.posZ = false;
+    auto attached = decoded;
+    attached.depth.emplace();
+    AgcDriver::Graphics::NormalizeUnusedViewportDepth(attached, pixel);
+    Require(attached.viewport.minDepth == -1, "attached depth was changed");
+    expectFailure([&] { AgcDriver::Graphics::ValidateViewport(context, attached.viewport); }, "viewport depth outside");
+    auto reversed = decoded;
+    reversed.viewport.minDepth = 2;
+    reversed.viewport.maxDepth = -1;
+    AgcDriver::Graphics::NormalizeUnusedViewportDepth(reversed, pixel);
+    AgcDriver::Graphics::ValidateViewport(context, reversed.viewport);
+    Require(reversed.viewport.minDepth == 1 && reversed.viewport.maxDepth == 0, "reversed unused depth is not representable");
+    auto bounded = decoded;
+    bounded.viewport.minDepth = 0.25f;
+    bounded.viewport.maxDepth = 0.75f;
+    AgcDriver::Graphics::NormalizeUnusedViewportDepth(bounded, pixel);
+    Require(bounded.viewport.minDepth == 0.25f && bounded.viewport.maxDepth == 0.75f, "an in-range viewport changed");
+    auto invalid = decoded;
+    invalid.viewport.minDepth = std::numeric_limits<float>::infinity();
+    AgcDriver::Graphics::NormalizeUnusedViewportDepth(invalid, pixel);
+    expectFailure([&] { AgcDriver::Graphics::ValidateViewport(context, invalid.viewport); }, "non-finite viewport");
 }
 
 void DepthClipTests() {
@@ -5840,6 +5894,15 @@ void descriptorCacheTests() {
         const auto reused = cache.Allocate(fittingLayout, fitting, true, 0u);
         Require(reused.pool == chained.pool && mock.variableDescriptorCount == 0u, "reusing an update-after-bind pool lost an empty variable image table");
         cache.Free(reused);
+        const auto rewritten = cache.AllocateRewritten(fittingLayout, fitting, true, 3u);
+        cache.Recycle(fittingLayout, rewritten);
+        const std::array<VkDescriptorPoolSize, 2> grown{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 17}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 5}}};
+        const auto larger = cache.AllocateRewritten(fittingLayout, grown, true, 5u);
+        Require(larger.set != rewritten.set && mock.variableDescriptorCount == 5u, "a recycled descriptor set served a larger variable image table than it was allocated for");
+        const auto same = cache.AllocateRewritten(fittingLayout, fitting, true, 3u);
+        Require(same.set == rewritten.set, "a recycled descriptor set was not reused for a variable image table of its own size");
+        cache.Free(larger);
+        cache.Free(same);
         expectFailure([&] { cache.Allocate(fittingLayout, fitting, false, 3u); }, "descriptor set exceeds the device's per-set descriptor limit");
     }
     Require(mock.live == 0, "the combined descriptor cache leaked a pool or layout");
@@ -7090,6 +7153,41 @@ void rectListTests() {
     }
     Require(drawFailure(0, true).empty(), "an indexed draw without indices was not skipped");
     const AgcDriver::Pm4::DrawParameters noInstances{reinterpret_cast<std::uint64_t>(indices.data()), 3, 2, 0, 0, true};
+    Draw(context, state, noInstances, {});
+}
+
+void quadListTests() {
+    using namespace AgcDriver::Graphics;
+    auto queue = makeState();
+    queue.userConfig[0x242] = 19;
+    queue.context[0x1b3] = queue.context[0x1b4] = 2;
+    Require(DrawRejection(queue, false).empty(), "valid quad-list draw failed precheck");
+    auto state = DecodeState(queue);
+    Require(state.quadList, "quad-list state flag was not set");
+    Require(state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, "quad-list did not decode to triangle list topology");
+    Require(RasterPrimitiveOf(state) == ShaderRecompiler::RasterPrimitive::Triangle, "quad-list did not produce triangle raster primitive");
+    Require(!state.primitiveRestart, "quad-list must not have primitive restart enabled");
+    queue.userConfig[0x24b] = 1;
+    state = DecodeState(queue);
+    Require(!state.primitiveRestart, "quad-list must suppress primitive restart");
+    queue.userConfig[0x24b] = 0;
+    const Context context{};
+    std::array<std::uint16_t, 8> indices{0, 1, 2, 3, 2, 3, 4, 5};
+    const auto drawOutcome = [&](std::uint32_t count, bool indexed) {
+        const AgcDriver::Pm4::DrawParameters draw = indexed ? AgcDriver::Pm4::DrawParameters{reinterpret_cast<std::uint64_t>(indices.data()), count, 2, 1, 0, true} : AgcDriver::Pm4::DrawParameters{0, count, 0, 1, 0, false};
+        try {
+            Draw(context, state, draw, {});
+        } catch (const std::exception& error) {
+            return std::string(error.what());
+        }
+        return std::string{};
+    };
+    for (const auto indexed : {false, true}) {
+        const auto complete = drawOutcome(4, indexed);
+        for (const auto count : {5u, 6u, 7u}) Require(drawOutcome(count, indexed) == complete, "a quad-list draw with partial trailing vertices was not drawn like complete quads");
+    }
+    Require(drawOutcome(0, true).empty(), "an indexed quad-list draw without indices was not skipped");
+    const AgcDriver::Pm4::DrawParameters noInstances{reinterpret_cast<std::uint64_t>(indices.data()), 4, 2, 0, 0, true};
     Draw(context, state, noInstances, {});
 }
 
@@ -9534,6 +9632,11 @@ int main(int argc, char** argv) {
             descriptorCacheTests();
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--unused-viewport-depth") {
+            UnusedViewportDepthTests();
+            DepthClipTests();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--unused-stencil-reference") {
             stencilReferenceUnusedTests();
             return 0;
@@ -9579,6 +9682,69 @@ int main(int argc, char** argv) {
             Require(mock.live == 0, "sparse buffer hole tests leaked Vulkan objects");
             std::cout << "sparse buffer hole tests " << (passed ? "passed" : "failed") << '\n';
             return passed ? 0 : 1;
+        }
+        if (argc == 2 && (std::string_view(argv[1]) == "--heap-mirror-unwatch" || std::string_view(argv[1]) == "--heap-mirror-unwatched-import")) {
+            {
+                mock = MockVulkan{};
+                auto context = mockContext();
+                context.bufferDeviceAddress = true;
+                context.limits.maxStorageBufferRange = 1u << 27;
+                RunHeapMirrorUnwatchTests(context, {
+                    [](VkBuffer buffer) -> std::span<std::byte> { return mockBufferMemory(buffer); },
+                    {},
+                    [](VkDeviceAddress address) {
+                        const auto offset = address - 0x100000000000ULL;
+                        const auto buffer = reinterpret_cast<VkBuffer>(offset / 0x10000);
+                        return mockBufferMemory(buffer).subspan(offset % 0x10000);
+                    },
+                    {},
+                    {}
+                }, std::string_view(argv[1]) == "--heap-mirror-unwatched-import");
+            }
+            Require(mock.live == 0, "the heap mirror unwatch test leaked Vulkan objects");
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--sparse-heap-mirror-unwatch") {
+            {
+                mock = MockVulkan{};
+                auto context = mockContext();
+                context.bufferDeviceAddress = true;
+                context.limits.maxStorageBufferRange = 1u << 27;
+                RunSparseHeapMirrorUnwatchTests(context, {
+                    [](VkBuffer buffer) -> std::span<std::byte> { return mockBufferMemory(buffer); },
+                    {},
+                    [](VkDeviceAddress address) {
+                        const auto offset = address - 0x100000000000ULL;
+                        const auto buffer = reinterpret_cast<VkBuffer>(offset / 0x10000);
+                        return mockBufferMemory(buffer).subspan(offset % 0x10000);
+                    },
+                    {},
+                    {}
+                });
+            }
+            Require(mock.live == 0, "the sparse heap mirror unwatch test leaked Vulkan objects");
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--heap-mirror-run-unwatch") {
+            {
+                mock = MockVulkan{};
+                auto context = mockContext();
+                context.bufferDeviceAddress = true;
+                context.limits.maxStorageBufferRange = 1u << 27;
+                RunHeapMirrorRunUnwatchTests(context, {
+                    [](VkBuffer buffer) -> std::span<std::byte> { return mockBufferMemory(buffer); },
+                    {},
+                    [](VkDeviceAddress address) {
+                        const auto offset = address - 0x100000000000ULL;
+                        const auto buffer = reinterpret_cast<VkBuffer>(offset / 0x10000);
+                        return mockBufferMemory(buffer).subspan(offset % 0x10000);
+                    },
+                    {},
+                    {}
+                });
+            }
+            Require(mock.live == 0, "the heap mirror run unwatch test leaked Vulkan objects");
+            return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--address-space-teardown") {
             addressSpaceTeardownTests();
@@ -9693,6 +9859,7 @@ int main(int argc, char** argv) {
         srgb8TargetTests();
         DepthClipTests();
         DepthRemapTests();
+        UnusedViewportDepthTests();
         DepthStencilTests();
         OneDimensionalColorTests();
         htileDepthClearTests();
@@ -9789,6 +9956,7 @@ int main(int argc, char** argv) {
         parallelCompareTests();
         pixelParameterSlotTests();
         rectListTests();
+        quadListTests();
         floatControlsModeTests();
         barycentricEmulationTests();
         copiedWriterIndirectOverlapTests();

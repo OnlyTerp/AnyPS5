@@ -41,6 +41,7 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/StringExtensions.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/VectorAlgorithms.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Math.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/MathExact.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Random.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/FloatBuiltins.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/HostEntropy.cpp
@@ -315,6 +316,15 @@ if(BUILD_TESTING)
     set_tests_properties(guest_std_execute_once PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(guest_std_execute_once PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test_executable(guest_math_exact_tests ${LIBS_INCLUDE_DIR}/tests/GuestMathExact.cpp)
+    target_include_directories(guest_math_exact_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_math_exact_tests PRIVATE libc)
+    configure_windows_unwind(guest_math_exact_tests)
+    add_test(NAME guest_math_exact COMMAND guest_math_exact_tests)
+    if(WIN32)
+        set_tests_properties(guest_math_exact PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(guest_libc_threads_tests ${LIBS_INCLUDE_DIR}/tests/GuestLibcThreads.cpp)
@@ -721,6 +731,15 @@ if(BUILD_TESTING)
     add_test(NAME application_heap_default COMMAND application_heap_tests default)
     add_test(NAME application_heap_exit_order COMMAND application_heap_tests exit-order)
     add_test(NAME application_heap_lazy COMMAND application_heap_tests lazy)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_library(guest_sdk_heap_fixture MODULE ${LIBS_INCLUDE_DIR}/tests/GuestSdkHeap.cpp)
+        add_library(guest_sdk_heap_partial_fixture MODULE ${LIBS_INCLUDE_DIR}/tests/GuestSdkHeap.cpp)
+        target_compile_definitions(guest_sdk_heap_partial_fixture PRIVATE SDK_HEAP_PARTIAL)
+        set_target_properties(application_heap_tests PROPERTIES ENABLE_EXPORTS ON)
+        add_dependencies(application_heap_tests guest_sdk_heap_fixture guest_sdk_heap_partial_fixture)
+        add_test(NAME application_heap_guest_sdk COMMAND application_heap_tests sdk $<TARGET_FILE:guest_sdk_heap_fixture>)
+        add_test(NAME application_heap_guest_sdk_partial COMMAND application_heap_tests sdk-partial $<TARGET_FILE:guest_sdk_heap_partial_fixture>)
+    endif()
     if(WIN32)
         set_tests_properties(application_heap_replacement application_heap_invalid_metadata application_heap_default application_heap_exit_order application_heap_lazy
             PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
