@@ -61,6 +61,7 @@ alignas(256) constexpr std::array<std::uint32_t, 40> VertexCodeUser8 = [] {
     return code;
 }();
 
+alignas(256) constexpr std::array<std::uint32_t, 7> PixelConstant{0x7e1002f2u, 0x7e1202f2u, 0x7e1402f2u, 0x7e1602f2u, 0xf800180fu, 0x0b0a0908u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 11> PixelRead{0x7e1a0280u, 0xdc308000u, 0x0c02000du, 0xbf8c3f70u, 0x7e10030cu, 0x7e120280u, 0x7e140280u, 0x7e160280u, 0xf800180fu, 0x0b0a0908u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 9> PixelColorWord{0x7e100280u, 0x7e120280u, 0x7e1402ffu, 0x3f008081u, 0x7e1602ffu, 0x3e7cfcfdu, 0xf800180fu, 0x0b0a0908u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 11> PixelDescriptorStore{0x7e0202f2u, 0x7e040280u, 0xe0701000u, 0x80010102u, 0x7e1002f2u, 0x7e1202f2u, 0x7e1402f2u, 0x7e1602f2u, 0xf800180fu, 0x0b0a0908u, 0xbf810000u};
@@ -72,6 +73,7 @@ struct Header {
 };
 
 alignas(8) Header VertexHeader{};
+alignas(8) Header ConstantHeader{};
 alignas(8) Header ReadHeader{};
 alignas(8) Header StoreHeader{};
 alignas(8) Header DescriptorStoreHeader{};
@@ -214,6 +216,14 @@ void ReadersShareAPass(const GuestBlock& vertices, const GuestBlock& data, const
     Expect(after.draws - before.draws == 2 && after.passesContinued - before.passesContinued == 1, "a draw reading through the table after another did not continue its pass: " + Counts(before, after));
 }
 
+void StoreBesideReadsContinues(const GuestBlock& vertices, const GuestBlock& data, const GuestBlock& target) {
+    const auto before = AddressDraws();
+    Submit(vertices, target, {{PixelConstant.data(), 0}, {PixelStore.data(), data.At(16)}});
+    const auto after = AddressDraws();
+    std::printf("a draw storing through the table after a draw reading read-only memory: %s\n", Counts(before, after).c_str());
+    Expect(after.draws - before.draws == 1 && after.passesContinued - before.passesContinued == 1, "a draw whose table grants no write over the pass's reads did not continue its pass: " + Counts(before, after));
+}
+
 void StoreAfterTableReadBreaks(const GuestBlock& vertices, const GuestBlock& data, const GuestBlock& target) {
     const auto before = AddressDraws();
     Submit(vertices, target, {{PixelRead.data(), data.At(32)}, {PixelStore.data(), data.At(32)}});
@@ -299,6 +309,7 @@ int main(int argc, char** argv) {
             if (!device) return VulkanTestSkipped;
         }
         Register(VertexHeader, VertexCodeUser8.data(), sizeof(VertexCodeUser8), 2);
+        Register(ConstantHeader, PixelConstant.data(), sizeof(PixelConstant), 1);
         Register(ReadHeader, PixelRead.data(), sizeof(PixelRead), 1);
         Register(StoreHeader, PixelStore.data(), sizeof(PixelStore), 1);
         Register(DescriptorStoreHeader, PixelDescriptorStore.data(), sizeof(PixelDescriptorStore), 1);
@@ -312,6 +323,7 @@ int main(int argc, char** argv) {
         target.Map(true);
         const std::string only = argc > 1 ? argv[1] : "";
         if (only.empty() || only == "--readers") ReadersShareAPass(readOnlyVertices, data, target);
+        if (only.empty() || only == "--store-beside-reads") StoreBesideReadsContinues(readOnlyVertices, data, target);
         if (only.empty() || only == "--store-after-read") StoreAfterTableReadBreaks(readOnlyVertices, data, target);
         if (only.empty() || only == "--read-sees-store") ReadSeesStore(readOnlyVertices, data, target);
         if (only.empty() || only == "--read-sees-descriptor-store") ReadSeesDescriptorStore(readOnlyVertices, data, target);

@@ -225,6 +225,8 @@ public:
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool BdaReadOnly() const { return usesBda && bdaReadOnly; }
     bool UsesAddressTable() const { return usesBda; }
+    bool StoresThroughAddresses() const { return usesBda && !bdaReadOnly; }
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>>& AddressWrites() const { return addressWrites; }
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
     bool CopiedWritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.CopiedWritesOverlap(address, bytes); }
@@ -537,6 +539,7 @@ private:
     std::unique_ptr<BdaResources> bda;
     bool usesBda = false;
     bool bdaReadOnly = true;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> addressWrites;
     std::vector<std::uint64_t> multisampleSources;
     bool usesFaultBuffer = false;
     bool faultChecks = false;
