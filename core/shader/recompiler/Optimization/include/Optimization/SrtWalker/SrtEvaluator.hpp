@@ -74,6 +74,12 @@ struct InaccessibleRead {
     std::uint64_t address = 0;
 };
 
+enum class EvaluatorReads : std::uint8_t {
+    Nothing,
+    Arguments,
+    Closure,
+};
+
 class DenseValues {
 public:
     struct Slot {
@@ -172,6 +178,7 @@ public:
     BasicEvaluator(const BasicEvaluator&) = delete;
     BasicEvaluator& operator=(const BasicEvaluator&) = delete;
 
+    static EvaluatorReads Reads(const IrResourcePlan& program, const IrValue& value);
     static bool MayEvaluate(const IrResourcePlan& program, IrValue* value, const IrValue* activeMask = nullptr);
     bool Evaluate(TNode value, std::uint32_t& result);
     bool EvaluateWide(TNode value, std::uint64_t& result);

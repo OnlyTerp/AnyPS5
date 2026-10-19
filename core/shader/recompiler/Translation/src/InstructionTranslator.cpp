@@ -496,6 +496,9 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
     program.Resources().shaderHash = options.shaderHash;
     program.Resources().userDataBase = options.userDataBaseRegister;
     program.Resources().userDataCount = options.userDataCount;
+    if (options.stage == ShaderStageKind::Compute && options.inputInfo.compute != nullptr) {
+        std::copy(std::begin(options.inputInfo.compute->threadsNum), std::end(options.inputInfo.compute->threadsNum), program.Resources().workgroupThreads.begin());
+    }
     program.Info().scratchDwords = options.scratchDwords;
     program.Info().sharedMemoryBytes = options.sharedMemoryBytes;
     if (options.embeddedFetch != nullptr) {

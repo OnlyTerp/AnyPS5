@@ -656,6 +656,149 @@ void verifyMayEvaluate() {
     }
 }
 
+void verifyPlanConditionPruning() {
+    using namespace ShaderRecompiler;
+    std::vector<std::unique_ptr<IrValue>> values;
+    std::uint32_t ids = 0;
+    const auto make = [&](IrOpcode opcode, IrType type) -> IrValue& {
+        values.push_back(std::make_unique<IrValue>(opcode, type, ids++));
+        return *values.back();
+    };
+    const auto constant = [&](std::uint32_t value) -> IrValue& {
+        auto& immediate = make(IrOpcode::Void, IrType::U32);
+        immediate.SetImmediateU32(value);
+        return immediate;
+    };
+    const auto userData = [&](std::uint32_t index) -> IrValue& {
+        auto& reg = make(IrOpcode::Void, IrType::ScalarReg);
+        reg.SetRegister({RegisterBank::Scalar, index});
+        auto& read = make(IrOpcode::GetUserData, IrType::U32);
+        read.AddArgument(&reg);
+        return read;
+    };
+    const auto equal = [&](IrValue& left, IrValue& right) -> IrValue& {
+        auto& compare = make(IrOpcode::IEqual32, IrType::Bool);
+        compare.AddArgument(&left);
+        compare.AddArgument(&right);
+        return compare;
+    };
+    constexpr std::uint32_t Additions = 64;
+    IrValue* address = &userData(0);
+    for (std::uint32_t index = 0; index < Additions; ++index) {
+        auto& sum = make(IrOpcode::IAdd32, IrType::U32);
+        sum.AddArgument(address);
+        sum.AddArgument(&constant(4));
+        address = &sum;
+    }
+    auto& load = make(IrOpcode::LoadBufferU32, IrType::U32);
+    load.AddArgument(address);
+    auto& pair = make(IrOpcode::CompositeConstructU32x2, IrType::U32x2);
+    pair.AddArgument(&userData(1));
+    pair.AddArgument(&load);
+    auto& low = make(IrOpcode::CompositeExtractU32x2, IrType::U32);
+    low.AddArgument(&pair);
+    low.AddArgument(&constant(0));
+    static std::uint32_t word = 5;
+    const auto wordAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&word));
+    auto& handle = make(IrOpcode::CompositeConstructU64, IrType::U64);
+    handle.AddArgument(&userData(2));
+    handle.AddArgument(&userData(3));
+    auto& read = make(IrOpcode::LoadAddressU32, IrType::U32);
+    read.SetFlags(MemoryFlags{0, 0});
+    read.AddArgument(&handle);
+    read.AddArgument(&constant(0));
+    auto& choice = make(IrOpcode::SelectU32, IrType::U32);
+    choice.AddArgument(&equal(userData(4), constant(0)));
+    choice.AddArgument(&load);
+    choice.AddArgument(&constant(1));
+    IrProgram program;
+    auto& resources = program.Resources();
+    resources.srtPlanComplete = true;
+    resources.resourceTrackingComplete = true;
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    resources.memoryInfo.push_back(memory);
+    resources.controlFlow.push_back({&equal(load, constant(0)), {1, 2}, {}, {}});
+    resources.controlFlow.push_back({&equal(low, constant(7)), {3, 4}, {}, {}});
+    resources.controlFlow.push_back({&equal(read, constant(5)), {5, 6}, {}, {}});
+    resources.controlFlow.push_back({&equal(choice, constant(1)), {7, 8}, {}, {}});
+    const auto plan = ResourceMaterializer{}.ExtractPlan(program);
+    const auto copied = std::ranges::count_if(plan.valueStorage, [](const auto& value) { return value.Opcode() == IrOpcode::IAdd32; });
+    require(copied == 0, "plan pruning: the address computation under a load the evaluator cannot read was copied");
+    require(plan.controlFlow[0].condition == nullptr && plan.controlFlow[3].condition == nullptr, "plan pruning: a condition the evaluator can never read was kept");
+    require(plan.controlFlow[1].condition != nullptr && plan.controlFlow[2].condition != nullptr, "plan pruning: a condition the evaluator can read was dropped");
+    const auto copiedLoad = std::ranges::find_if(plan.valueStorage, [](const auto& value) { return value.Opcode() == IrOpcode::LoadBufferU32; });
+    require(copiedLoad != plan.valueStorage.end() && copiedLoad->ArgumentCount() == 0u, "plan pruning: the unevaluable load was not kept as a leaf");
+    require(std::ranges::all_of(plan.valueStorage, [](const auto& value) { return value.Uses().empty() && value.OperandUses().empty() && value.Arguments().capacity() == value.ArgumentCount(); }), "plan compaction: a plan value keeps use lists or spare operand capacity");
+    const std::array<std::uint32_t, 4> data{0x100u, 7u, static_cast<std::uint32_t>(wordAddress), static_cast<std::uint32_t>(wordAddress >> 32u)};
+    SrtRuntime runtime{data};
+    Detail::Evaluator evaluator(plan, runtime);
+    std::uint32_t result = 0;
+    require(evaluator.Evaluate(Detail::IrNode(plan.controlFlow[1].condition), result) && result == 1u, "plan pruning: a condition read through an extracted pair was not evaluated");
+    require(evaluator.Evaluate(Detail::IrNode(plan.controlFlow[2].condition), result) && result == 1u, "plan pruning: a condition on a raw read lost its handle");
+
+    std::vector<std::size_t> retainedCounts;
+    for (const std::uint32_t chain : {1u, 16u, 64u}) {
+        std::vector<std::unique_ptr<IrValue>> chainValues;
+        std::uint32_t chainIds = 0;
+        const auto makeChain = [&](IrOpcode opcode, IrType type) -> IrValue& {
+            chainValues.push_back(std::make_unique<IrValue>(opcode, type, chainIds++));
+            return *chainValues.back();
+        };
+        const auto chainConst = [&](std::uint32_t val) -> IrValue& {
+            auto& imm = makeChain(IrOpcode::Void, IrType::U32);
+            imm.SetImmediateU32(val);
+            return imm;
+        };
+        const auto chainUserData = [&](std::uint32_t index) -> IrValue& {
+            auto& reg = makeChain(IrOpcode::Void, IrType::ScalarReg);
+            reg.SetRegister({RegisterBank::Scalar, index});
+            auto& ud = makeChain(IrOpcode::GetUserData, IrType::U32);
+            ud.AddArgument(&reg);
+            return ud;
+        };
+        auto& vgpr = makeChain(IrOpcode::Void, IrType::VectorReg);
+        vgpr.SetRegister({RegisterBank::Vector, 0});
+        IrValue* vecAddr = &makeChain(IrOpcode::GetRegister, IrType::U32);
+        vecAddr->AddArgument(&vgpr);
+        for (std::uint32_t step = 0; step < chain; ++step) {
+            auto& add = makeChain(IrOpcode::IAdd32, IrType::U32);
+            add.AddArgument(vecAddr);
+            add.AddArgument(&chainConst(1));
+            vecAddr = &add;
+        }
+        auto& vecLoad = makeChain(IrOpcode::LoadBufferU32, IrType::U32);
+        vecLoad.AddArgument(vecAddr);
+        auto& activeMask = makeChain(IrOpcode::Void, IrType::Bool);
+        activeMask.SetImmediateU32(1);
+        auto& firstLane = makeChain(IrOpcode::ReadFirstLane, IrType::U32);
+        firstLane.AddArgument(&vecLoad);
+        firstLane.AddArgument(&activeMask);
+        auto& srtHandle = makeChain(IrOpcode::CompositeConstructU64, IrType::U64);
+        srtHandle.AddArgument(&chainUserData(0));
+        srtHandle.AddArgument(&chainUserData(1));
+        auto& scalarLoad = makeChain(IrOpcode::LoadAddressU32, IrType::U32);
+        scalarLoad.SetFlags(MemoryFlags{0, 0});
+        scalarLoad.AddArgument(&srtHandle);
+        scalarLoad.AddArgument(&firstLane);
+        auto& cmp = makeChain(IrOpcode::IEqual32, IrType::Bool);
+        cmp.AddArgument(&scalarLoad);
+        cmp.AddArgument(&chainConst(0));
+        IrProgram chainProgram;
+        auto& chainRes = chainProgram.Resources();
+        chainRes.srtPlanComplete = true;
+        chainRes.resourceTrackingComplete = true;
+        MemoryInfo scalarMem;
+        scalarMem.kind = ResourceKind::ScalarAddress;
+        chainRes.memoryInfo.push_back(scalarMem);
+        chainRes.controlFlow.push_back({&cmp, {1, 2}, {}, {}});
+        const auto extracted = ResourceMaterializer{}.ExtractPlan(chainProgram);
+        require(extracted.controlFlow[0].condition != nullptr, "plan retention: the plan keeps no branch condition");
+        retainedCounts.push_back(extracted.valueStorage.Size());
+    }
+    require(retainedCounts[0] == retainedCounts[1] && retainedCounts[1] == retainedCounts[2], "plan retention: the plan keeps different value counts for vector chains of 1, 16 and 64 steps before a scalar load");
+}
+
 void verifyEvaluatedValues() {
     using namespace ShaderRecompiler;
     std::vector<std::unique_ptr<IrValue>> values;
@@ -7246,6 +7389,7 @@ int main(int argc, char** argv) {
         verifyOutOfRangeConstantReads();
         verifySignedMinimum();
         verifyMayEvaluate();
+        verifyPlanConditionPruning();
         verifyPureFlatSlots();
         verifyGuardedDescriptorSources();
         verifySrtTape();
