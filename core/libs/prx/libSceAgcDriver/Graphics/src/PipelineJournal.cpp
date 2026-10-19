@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PipelineCreation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "ShaderCacheDirectory.hpp"
 #include "ShaderDiskCache.hpp"
@@ -902,6 +903,7 @@ public:
 
 private:
     void run() {
+        const CreationAhead ahead;
         std::call_once(loadOnce, [&] {
             try {
                 auto journal = Journal::Instance().Load();

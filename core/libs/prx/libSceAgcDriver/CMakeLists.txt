@@ -159,6 +159,7 @@ endforeach()
 set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ComputePipelineCapture.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PipelineCreation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostHdr.cpp
@@ -2526,6 +2527,16 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(agc_compute_pipeline_capture PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test_executable(agc_pipeline_creation_gate_tests tests/PipelineCreationGate.cpp Execution/src/PipelineCreation.cpp)
+    target_include_directories(agc_pipeline_creation_gate_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_pipeline_creation_gate_tests PRIVATE libc)
+    set_target_properties(agc_pipeline_creation_gate_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_pipeline_creation_gate_tests)
+    add_test(NAME agc_pipeline_creation_gate COMMAND agc_pipeline_creation_gate_tests)
+    set_tests_properties(agc_pipeline_creation_gate PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_pipeline_creation_gate PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
 
 if(BUILD_TESTING AND ANYPS5_ENABLE_SPIRV_TOOLS)
@@ -2551,6 +2562,17 @@ if(BUILD_TESTING AND ANYPS5_ENABLE_SPIRV_TOOLS)
     if(WIN32)
         set_tests_properties(agc_compute_pipeline_replay agc_compute_pipeline_capture_run PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+endif()
+
+if(BUILD_TESTING AND WIN32)
+    add_test_executable(agc_compute_pipeline_budget_tests tests/ComputePipelineBudget.cpp)
+    target_include_directories(agc_compute_pipeline_budget_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+    target_link_libraries(agc_compute_pipeline_budget_tests PRIVATE libSceAgcDriver libc)
+    set_target_properties(agc_compute_pipeline_budget_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_compute_pipeline_budget_tests)
+    add_dependencies(agc_compute_pipeline_budget_tests agc_compute_pipeline_replay)
+    add_test(NAME agc_compute_pipeline_budget COMMAND agc_compute_pipeline_budget_tests $<TARGET_FILE:agc_compute_pipeline_replay>)
+    set_tests_properties(agc_compute_pipeline_budget PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
 endif()
 
 if(BUILD_TESTING)
