@@ -9,12 +9,14 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <list>
 #include <map>
 #include <memory>
 #include <set>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
@@ -66,6 +68,48 @@ struct DispatchEntry {
     std::list<std::uint64_t>::iterator order;
 };
 
+[[nodiscard]] std::uint64_t DispatchVariantBytes(const DispatchVariant& variant);
+
+class DispatchEntries {
+public:
+    DispatchEntries(std::size_t entryLimit, std::uint64_t byteBudget);
+    [[nodiscard]] std::shared_ptr<DispatchEntry> Find(std::uint64_t key) const;
+    [[nodiscard]] bool Admits(const DispatchVariant& variant) const;
+    void Insert(std::uint64_t key, std::shared_ptr<DispatchVariant> variant, std::uint64_t touched);
+    std::uint64_t Prepend(std::uint64_t key, std::shared_ptr<DispatchVariant> variant, std::size_t variantLimit, std::uint64_t touched);
+    void Promote(std::uint64_t key, std::size_t rank);
+    bool Touch(std::uint64_t key, std::uint64_t now, std::uint64_t interval);
+    std::uint64_t Trim(std::uint64_t keep);
+    std::uint64_t Clear();
+    [[nodiscard]] bool OverLimits() const { return entries.size() > entryLimit || bytes > byteBudget; }
+    [[nodiscard]] std::size_t Size() const { return entries.size(); }
+    [[nodiscard]] std::uint64_t Variants() const { return variants; }
+    [[nodiscard]] std::uint64_t Bytes() const { return bytes; }
+    [[nodiscard]] std::uint64_t Budget() const { return byteBudget; }
+
+private:
+    void account(const DispatchVariant& variant, bool added);
+    void erase(std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>>::iterator it);
+
+    std::size_t entryLimit;
+    std::uint64_t byteBudget;
+    std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>> entries;
+    std::list<std::uint64_t> order;
+    std::uint64_t variants = 0;
+    std::uint64_t bytes = 0;
+};
+
+class PriorValueSets {
+public:
+    explicit PriorValueSets(std::size_t keyLimit);
+    [[nodiscard]] bool Matches(std::uint64_t key, const DispatchVariant& variant) const;
+    void Remember(std::uint64_t key, const DispatchVariant& variant);
+
+private:
+    std::size_t keyLimit;
+    std::unordered_map<std::uint64_t, std::deque<std::uint64_t>> rings;
+};
+
 struct EntryCounters {
     std::uint64_t lookups = 0, absent = 0, equal = 0, differing = 0, inaccessible = 0, queuedLabel = 0, flushingImage = 0, publishMoved = 0, pendingMoved = 0, forgetMoved = 0, deviceImageFallbacks = 0, imagesFlushed = 0, runsSynced = 0, forgetSinceInsert = 0, replaced = 0, inserts = 0, unstable = 0, touches = 0;
 
@@ -76,7 +120,7 @@ struct EntryCounters {
     std::array<std::uint64_t, 4> differingWordBuckets{};
 
     std::array<std::uint64_t, MaxDispatchVariants> variantHitsByRank{};
-    std::uint64_t variantsCompared = 0, variantsInserted = 0, variantsEvicted = 0;
+    std::uint64_t variantsCompared = 0, variantsInserted = 0, variantsEvicted = 0, variantsOverBudget = 0;
 
     std::uint64_t dataHits = 0, dataWordsRefreshed = 0, dataVerified = 0, dataInserts = 0, dataPositionsInserted = 0, dataLeavesUnmapped = 0, dataLeavesMismatched = 0, dataLeavesAliased = 0;
     std::array<std::uint64_t, MaxDispatchVariants> dataHitsByRank{};

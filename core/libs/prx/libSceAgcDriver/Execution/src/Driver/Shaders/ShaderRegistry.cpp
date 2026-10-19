@@ -1,4 +1,5 @@
 #include "prx/libc/include/general/LogMacros.hpp"
+#include "prx/libc/include/HostThread.hpp"
 #include "ControlFlow/GraphBuilder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PipelineCreation.hpp"
@@ -34,7 +35,6 @@
 #include <map>
 #include <mutex>
 #include <atomic>
-#include <pthread.h>
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
@@ -1506,33 +1506,24 @@ public:
     }
 
     void Close() {
-        std::vector<pthread_t> joined;
-        {
-            std::unique_lock lock(mutex);
-            closed = true;
-            idle.wait(lock, [&] { return tasks.empty() && running == 0; });
-            joined.swap(workers);
-        }
+        std::unique_lock lock(mutex);
+        closed = true;
         ready.notify_all();
-        for (const auto worker : joined) {
-            if (!pthread_equal(worker, pthread_self())) pthread_join(worker, nullptr);
-        }
+        idle.wait(lock, [&] { return tasks.empty() && running == 0 && activeWorkers == 0; });
     }
 
 private:
     explicit RegistrationPreparePool(unsigned count) {
-        pthread_attr_t attributes;
-        pthread_attr_init(&attributes);
-        pthread_attr_setstacksize(&attributes, 64u << 20u);
         for (unsigned index = 0; index < count; ++index) {
-            pthread_t thread;
-            if (pthread_create(&thread, &attributes, &RegistrationPreparePool::Main, this) == 0) {
-                workers.push_back(thread);
+            liveWorkers.fetch_add(1, std::memory_order_acq_rel);
+            ++activeWorkers;
+            if (HostThread::StartDetached(std::size_t{64} << 20u, &RegistrationPreparePool::Main, this)) {
                 ++threads;
-                liveWorkers.fetch_add(1, std::memory_order_acq_rel);
+            } else {
+                --activeWorkers;
+                liveWorkers.fetch_sub(1, std::memory_order_acq_rel);
             }
         }
-        pthread_attr_destroy(&attributes);
     }
 
     static void* Main(void* argument) {
@@ -1546,6 +1537,8 @@ private:
                 pool.ready.wait(lock, [&] { return !pool.tasks.empty() || pool.closed; });
                 if (pool.tasks.empty()) {
                     liveWorkers.fetch_sub(1, std::memory_order_acq_rel);
+                    --pool.activeWorkers;
+                    pool.idle.notify_all();
                     return nullptr;
                 }
                 task = std::move(pool.tasks.front());
@@ -1580,7 +1573,7 @@ private:
     std::condition_variable ready;
     std::condition_variable idle;
     std::deque<Task> tasks;
-    std::vector<pthread_t> workers;
+    unsigned activeWorkers = 0;
     unsigned threads = 0;
     inline static std::atomic<unsigned> liveWorkers{0};
     unsigned running = 0;
