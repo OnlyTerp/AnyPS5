@@ -222,7 +222,13 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     drawParameters = Pm4::ResolveDraw(packet, queue);
     tail.pipelined = DrawPipeline::Active();
     const bool pipelined = tail.pipelined;
-    if (pipelined && drawParameters.indirect) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
+    static const bool pipelinedIndirect = std::getenv("APS5_NO_PIPELINED_INDIRECT") == nullptr;
+    if (pipelined && drawParameters.indirect) {
+        const auto& indirect = *drawParameters.indirect;
+        auto& pipeline = DrawPipeline::Queue0();
+        const bool overlaps = pipeline.Busy() && (pipeline.Overlaps(indirect.arguments, static_cast<std::size_t>(std::max<std::uint64_t>(indirect.RangeBytes(), indirect.recordBytes))) || (indirect.countIndirect && pipeline.Overlaps(indirect.countAddress, 4)));
+        if (!pipelinedIndirect || overlaps) pipeline.Drain(DrawPipeline::DrainReason::Indirect);
+    }
     auto& traceIndirect = tail.traceIndirect;
     if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect)) return *verdict;
     phaseTiming.Phase(DrawRowPrecheck);
@@ -583,6 +589,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     auto& phaseTiming = tail.phaseTiming;
     auto& drawParameters = tail.drawParameters;
     const bool pipelined = tail.pipelined;
+    static const bool pipelinedIndirect = std::getenv("APS5_NO_PIPELINED_INDIRECT") == nullptr;
+    const auto drainBeforeInline = [&] {
+        if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
+    };
     auto& traceIndirect = tail.traceIndirect;
     const auto dumpTarget = tail.dumpTarget;
     const auto dumpSlot1 = tail.dumpSlot1;
@@ -919,6 +929,11 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto baseVertexWord = locate(indirect.baseVertexLocation);
         const auto startInstanceWord = locate(indirect.startInstanceLocation);
         const auto drawIndexWord = indirect.drawIndexEnabled ? locate(indirect.drawIndexLocation) : std::nullopt;
+        const auto drawable = [&](const Pm4::DrawArguments& arguments) { return arguments.count != 0 && arguments.instances != 0 && (!drawParameters.indexed || arguments.firstVertexOrIndex < drawParameters.indexCount); };
+        std::size_t lastDrawable = records.size();
+        for (std::size_t record = 0; record < records.size(); ++record) {
+            if (drawable(records[record])) lastDrawable = record;
+        }
         for (std::uint32_t record = 0; record < records.size(); ++record) {
             const auto& arguments = records[record];
             if (traceIndirect) std::fprintf(stderr, "[draw]   record %u: count %u instances %u first %u vertexOffset %u startInstance %u\n", record, arguments.count, arguments.instances, arguments.firstVertexOrIndex, arguments.vertexOffset, arguments.firstInstance);
@@ -967,6 +982,24 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 rejected = std::move(*known);
                 return DrawVerdict::Rejected;
             }
+            if (pipelined && pipelinedIndirect && record == lastDrawable && !gpuLock.owns_lock() && (tail.queue == nullptr || deferredLabels().labels.empty())) {
+                phaseTiming.Phase(DrawRowVectors);
+                auto writes = drawWriteRanges(graphics, stages);
+                const auto commitQueue = submission.queue;
+                const auto commitPacket = tail.packetOpcode;
+                const auto epoch = DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+                auto commit = [this, owner = tail.shared_from_this(), direct, snapshots = std::move(snapshots), commitQueue, commitPacket, epoch]() mutable {
+                    DrawPipeline::FollowEpoch(epoch);
+                    GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
+                    commitDraw(*owner, commitQueue, snapshots, nullptr, {}, direct);
+                };
+                auto held = std::make_shared<decltype(commit)>(std::move(commit));
+                DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, true);
+                phaseTiming.Phase(DrawRowLockWait);
+                timing.Mark("draw_enqueued");
+                return drawn();
+            }
+            drainBeforeInline();
             lockForDraw();
             noteDrawWriters(stages, submission.queue);
             phaseTiming.Phase(DrawRowVectors);
@@ -1011,6 +1044,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         timing.Mark("draw_enqueued");
         return drawn();
     }
+    if (drawParameters.indirect) drainBeforeInline();
     lockForDraw();
     noteDrawWriters(stages, submission.queue);
     phaseTiming.Phase(DrawRowVectors);
@@ -1031,13 +1065,13 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     return drawn();
 }
 
-void Driver::commitDraw(DrawTail& tail, std::uint32_t queue, std::vector<Graphics::GuestMemorySnapshot>& snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages) {
+void Driver::commitDraw(DrawTail& tail, std::uint32_t queue, std::vector<Graphics::GuestMemorySnapshot>& snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, const std::optional<Pm4::DrawParameters>& directParameters) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     auto localDevice = tail.localDevice;
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
     const auto& graphics = tail.decode->state;
-    const auto& drawParameters = tail.drawParameters;
+    const auto& drawParameters = directParameters ? *directParameters : tail.drawParameters;
     const auto& stages = tail.stages;
     struct SubmitDue {
         Driver& driver;
