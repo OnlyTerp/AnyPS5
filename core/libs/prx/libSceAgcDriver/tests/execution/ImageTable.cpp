@@ -51,10 +51,13 @@ constexpr std::uint32_t Format11_11_10UInt = 34;
 constexpr std::uint32_t Format8_8Srgb = 129;
 constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t Type3D = 10;
+constexpr std::uint32_t Type2DArray = 13;
+constexpr std::uint32_t ArrayLayers = 2;
 constexpr std::uint32_t DepthSwizzleMode = 0x18;
 
 alignas(256) std::array<float, Width * Height> FloatTexels{};
 alignas(256) std::array<float, Width * Height> OtherFloatTexels{};
+alignas(256) std::array<float, ArrayLayers * Width * Height> ArrayTexels{};
 alignas(256) std::array<std::uint32_t, Width * Height> UintTexels{};
 alignas(256) std::array<std::int32_t, Width * Height> SintTexels{};
 alignas(4096) std::array<std::uint32_t, 49152> DepthStorage{};
@@ -269,6 +272,15 @@ alignas(256) constexpr std::array<std::uint32_t, 30> SplitRecordCode{
     0x20000000u, 0x9312b011u, 0xf42c0802u, 0x24000000u, 0xf4280a02u, 0x24000020u, 0x360200bfu, 0x7e020d01u,
     0x060202f0u, 0x100202ffu, 0x3c800000u, 0x7e0402ffu, 0x3e000000u, 0xf09c0f08u, 0x01090401u, 0x7e120202u,
     0x34101286u, 0x4a101100u, 0x34101084u, 0xe0781000u, 0x80070408u, 0xbf810000u,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 41> ViewKindTableCode{
+    0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000020u, 0x8f108202u, 0xf4200444u,
+    0x20000000u, 0x9312b011u, 0xf42c0802u, 0x24000000u, 0xf4280a02u, 0x24000020u, 0x360200bfu, 0x7e020d01u,
+    0x060202f0u, 0x100202ffu, 0x3c800000u, 0x2c280086u, 0x7e280d14u, 0x060428ffu, 0x3e000000u, 0x060628f2u,
+    0xf09c0f28u, 0x01090401u, 0x081402f2u, 0x061628ffu, 0x3f200000u, 0x7e180314u, 0xf09c0f28u, 0x0109100au,
+    0x7e120202u, 0x34101286u, 0x4a101100u, 0x34101085u, 0xe0781000u, 0x80070408u, 0xe0781010u, 0x80071008u,
+    0xbf810000u,
 };
 
 alignas(256) constexpr std::array<std::uint32_t, 32> IndirectRecordCode{
@@ -1239,6 +1251,37 @@ void RunSplitRecordTests(AgcDriver::VulkanDevice& device) {
     for (std::uint32_t group = 0; group < 3; ++group) RequireRed(split, group, Lanes, texels[2u - group], std::string(names[2u - group]) + " texels of a T# read by two loads of its record");
 }
 
+void RunViewKindTests(AgcDriver::VulkanDevice& device) {
+    Fill();
+    for (std::uint32_t index = 0; index < ArrayTexels.size(); ++index) {
+        const auto layer = index / (Width * Height);
+        const auto texel = index % (Width * Height);
+        ArrayTexels[index] = static_cast<float>(texel % Width) + 100.0f * static_cast<float>(texel / Width) + 1000.0f * static_cast<float>(layer + 1u) + 0.75f;
+    }
+    Table = {};
+    SetRecord(0, PointClamp, Image(FloatTexels.data(), Format32Float));
+    SetRecord(1, PointClamp, Image(ArrayTexels.data(), Format32Float, Type2DArray));
+    Table[Stride / 4u + 8u] = ArrayLayers - 1u;
+    Keys = {};
+    constexpr std::array<std::uint32_t, 3> records{1u, 0u, 1u};
+    std::copy(records.begin(), records.end(), Keys.begin());
+    const auto outcome = Run(device, ViewKindTableCode, static_cast<std::uint32_t>(records.size()), Lanes, 64);
+    Require(!Faulted(outcome) && outcome.imageTableCount == 2u, "image table view kinds: a 2D and a 2D array entry sampled by 2D array instructions faulted or were not bound as two elements:\n" + outcome.log);
+    const auto texel = [](std::uint32_t record, std::uint32_t layer, std::uint32_t x, std::uint32_t y) {
+        return std::bit_cast<std::uint32_t>(record == 0u ? FloatTexels[y * Width + x] : ArrayTexels[(layer * Height + y) * Width + x]);
+    };
+    for (std::uint32_t group = 0; group < records.size(); ++group) {
+        for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
+            const auto* words = Output.data() + (group * Lanes + lane) * 8u;
+            const auto x = lane % Width;
+            const auto first = texel(records[group], 1u, x, 0u);
+            const auto second = texel(records[group], 0u, Width - 1u - x, 2u);
+            Require(words[0] == first && words[4] == second, "image table view kinds: group " + std::to_string(group) + " lane " + std::to_string(lane) + " sampled " + Hex(words[0]) + " and " + Hex(words[4]) + ", expected " + Hex(first) + " and " + Hex(second));
+        }
+    }
+    SetClassRecords();
+}
+
 void RunPointerStorageWriteTests(AgcDriver::VulkanDevice& device) {
     alignas(256) static std::array<std::uint32_t, 256u * 8u> records{};
     alignas(256) static std::array<std::uint32_t, 256u * 8u> otherRecords{};
@@ -1442,6 +1485,7 @@ int main() {
         RunPointerTests(*device);
         RunPointerRecordTests(*device);
         RunSplitRecordTests(*device);
+        RunViewKindTests(*device);
         RunPointerStorageWriteTests(*device);
         RunGraphicsTests(*device);
         std::puts("image table tests passed");

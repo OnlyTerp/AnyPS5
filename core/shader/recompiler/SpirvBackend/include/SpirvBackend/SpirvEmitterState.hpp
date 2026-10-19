@@ -3,6 +3,7 @@
 
 #include "SpirvBackend/SpirvModule.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
+#include "SpirvBackend/SpirvFunctionMatch.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include <array>
 #include <cstddef>
@@ -85,6 +86,23 @@ struct SpirvTableAccess {
     bool active = false;
     bool uniform = false;
     bool device = false;
+};
+
+struct SpirvSwizzleSelectors {
+    std::uint32_t label = 0;
+    std::uint32_t dword3 = 0;
+    std::array<std::uint32_t, 4> selectors{};
+};
+
+struct SpirvTableImageFunction {
+    IrOpcode opcode;
+    MemoryInfo memory;
+    bool uniform = false;
+    bool device = false;
+    std::vector<std::uint32_t> operands;
+    std::uint32_t function = 0;
+    std::vector<std::uint32_t> arguments;
+    SpirvFunctionBody body;
 };
 
 struct SpirvEmitterState {
@@ -189,6 +207,7 @@ struct SpirvEmitterState {
     std::array<std::uint32_t, ImageBindingCount> imageVariables {};
     std::uint32_t samplerVariable = 0;
     std::vector<SpirvTableImageVariable> tableImageVariables;
+    std::vector<SpirvTableImageFunction> tableImageFunctions;
     std::uint32_t tableSamplerVariable = 0;
     std::uint32_t tableMapVariable = 0;
     std::vector<SpirvTableImageVariable> deviceHeapVariables;
@@ -203,6 +222,7 @@ struct SpirvEmitterState {
     std::uint32_t meshCull = 0;
     std::uint32_t entryLabel = 0;
     std::uint32_t currentLabel = 0;
+    SpirvSwizzleSelectors swizzleSelectors;
     const IrBlock* currentBlock = nullptr;
     std::uint32_t pixelValidMaskVariable = 0;
     std::uint32_t quadPixelUncovered = 0;

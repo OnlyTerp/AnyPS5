@@ -300,6 +300,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.bdaStopsInvocations = state.waveLdsScope == 0 && !state.spannedWave && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
     EmitModuleHeader(state, bindings);
     EmitProgram(state);
+    state.module.SpillCallResults();
     state.module.EmitEntryPoint(ExecutionModelForStage(state.program.Resources().stage), state.mainFunc, "main", state.interfaceVariables);
     if (info != nullptr) info->fullSubgroups = state.spannedWave;
     return state.module.Finalize();

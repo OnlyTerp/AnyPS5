@@ -38,6 +38,7 @@
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -1702,6 +1703,63 @@ void verifyImageTables() {
     FillTableSrt(guest, heap.data(), 32u, 4u);
 }
 
+const std::vector<std::uint32_t> TableTwoSampleCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x93109010u, 0xf4200406u, 0x20000004u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0x7e020d00u, 0x100402f0u, 0x060602f2u, 0xf09c0f08u, 0x00450401u, 0xf09c0f08u, 0x00450802u, 0xe0700000u, 0x80070400u, 0xe0700004u, 0x80070800u, 0xbf810000u};
+
+struct TableSpirvFunction {
+    bool dontInline = false;
+    std::uint32_t switches = 0;
+    std::map<std::uint32_t, std::uint32_t> calls;
+};
+
+std::map<std::uint32_t, TableSpirvFunction> ScanTableFunctions(std::span<const std::uint32_t> words, std::uint32_t& entry) {
+    std::map<std::uint32_t, TableSpirvFunction> functions;
+    std::uint32_t current = 0;
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        require(count != 0 && count <= words.size() - cursor, "image table functions: truncated SPIR-V instruction");
+        const auto op = words[cursor] & 0xffffu;
+        if (op == spv::OpEntryPoint) entry = words[cursor + 2];
+        if (op == spv::OpFunction) {
+            current = words[cursor + 2];
+            functions[current].dontInline = (words[cursor + 3] & spv::FunctionControlDontInlineMask) != 0u;
+        }
+        if (op == spv::OpSwitch && count > 3u) ++functions[current].switches;
+        if (op == spv::OpFunctionCall) ++functions[current].calls[words[cursor + 3]];
+        cursor += count;
+    }
+    return functions;
+}
+
+void verifyImageTableFunctions() {
+    using namespace ShaderRecompiler;
+    static TableTexture textures[2];
+    alignas(4096) static TableGuest guest;
+    std::fill(guest.heap.begin(), guest.heap.end(), std::array<std::uint32_t, 8>{});
+    guest.heap[0] = TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D);
+    guest.heap[1] = TableT(textures[1].bytes.data(), TableFormat32UInt, TableType2D);
+    guest.materials = {{{0u, 1u, 0u, 0u}, {0u, 0u, 0u, 0u}, {0u, 1u, 0u, 0u}}};
+    FillTableSrt(guest, guest.heap.data(), 32u, 2u);
+    const auto userData = TableUserData(guest);
+    const auto request = TableRequest(TableTwoSampleCode, userData);
+    const auto compiled = CompileTable(request);
+    const auto& spirv = compiled.result->spirv;
+    std::uint32_t entry = 0;
+    const auto functions = ScanTableFunctions(spirv.Words(), entry);
+    require(functions.contains(entry), "image table functions: the module has no entry point function");
+    std::vector<std::uint32_t> switched;
+    for (const auto& [id, function] : functions) {
+        if (function.switches != 0u) switched.push_back(id);
+    }
+    const auto& main = functions.at(entry);
+    require(main.switches == 0u && switched.size() == 1u, ("image table functions: two samples of one table image with the same operand shapes left " + std::to_string(main.switches) + " mode switches in the entry point and " + std::to_string(switched.size()) + " functions with mode switches instead of one called function").c_str());
+    const auto& helper = functions.at(switched[0]);
+    const auto calls = main.calls.find(switched[0]);
+    require(helper.dontInline && helper.switches == 1u && calls != main.calls.end() && calls->second >= 2u, "image table functions: the mode switch function is inlinable, holds more than one switch or is not called once per sample");
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    static_cast<void>(ValidateAndOptimizeSpirv(spirv, request.target.vulkanVersion, request.target.spirvVersion));
+#endif
+}
+
 void verifyImageTableKeyUnion() {
     using namespace ShaderRecompiler;
     static TableTexture textures[3];
@@ -2197,6 +2255,40 @@ void verifyDeviceImageTables() {
         require(!plan->info.images.empty() && plan->info.images[0].table != NoTable && !plan->info.images[0].deviceTable, "device image tables: a column with a storage write, a depth compare, a sampler table or an unnormalized sampler left the CPU path");
         require(code != &samplerTableCode || (plan->info.samplers.size() == 1u && plan->info.samplers[0].table != NoTable), "device image tables: the sampler table program has no sampler table");
     }
+    const auto buildMultiSampleCode = [](std::uint32_t samples) {
+        std::vector<std::uint32_t> code{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000030u, 0xbe900302u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0x7e000280u, 0x7e020500u, 0x7e040280u};
+        for (std::uint32_t sample = 0; sample < samples; ++sample) {
+            code.insert(code.end(), {0x060202ffu, 0x358637bdu, 0xf09c0f08u, 0x00450401u, 0x06000104u});
+        }
+        code.insert(code.end(), {0xe0700000u, 0x80070000u, 0xbf810000u});
+        return code;
+    };
+    const auto twoSampleCode = buildMultiSampleCode(2u);
+    const auto threeSampleCode = buildMultiSampleCode(3u);
+    const auto manySampleCode = buildMultiSampleCode(64u);
+    const auto makeMultiSampleRequest = [&](const std::vector<std::uint32_t>& sampleCode) {
+        auto req = DeviceTableRequest(sampleCode, userData, false, true);
+        req.target.subgroupSize = 64u;
+        return req;
+    };
+    const auto twoSampleWords = CompileTable(makeMultiSampleRequest(twoSampleCode)).result->spirv.Words();
+    const auto threeSampleWords = CompileTable(makeMultiSampleRequest(threeSampleCode)).result->spirv.Words();
+    const auto sampleArmWords = threeSampleWords.size() - twoSampleWords.size();
+    require(sampleArmWords > 0u && sampleArmWords <= 2450u, ("device image tables: one more inline sample of a device-table texture adds " + std::to_string(sampleArmWords) + " SPIR-V words, expected at most 2450").c_str());
+    const auto manyRequest = makeMultiSampleRequest(manySampleCode);
+    const auto manyWords = CompileTable(manyRequest).result->spirv.Words();
+    std::uint32_t manyEntry = 0;
+    const auto manyFunctions = ScanTableFunctions(manyWords, manyEntry);
+    require(manyFunctions.contains(manyEntry), "device image tables: the 64-sample module has no entry point function");
+    std::vector<std::uint32_t> manySwitched;
+    for (const auto& [id, function] : manyFunctions) {
+        if (function.switches != 0u) manySwitched.push_back(id);
+    }
+    const auto& manyMain = manyFunctions.at(manyEntry);
+    require(manyMain.switches == 0u && manySwitched.size() == 1u && manyFunctions.at(manySwitched[0]).dontInline && manyMain.calls.at(manySwitched[0]) == 64u, "device image tables: 64 samples of a device-table texture did not share one DontInline mode switch function once inline switches exceeded the program budget");
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    static_cast<void>(ValidateAndOptimizeSpirv(manyWords, manyRequest.target.vulkanVersion, manyRequest.target.spirvVersion));
+#endif
 }
 
 void verifyScalarAddressRule() {
@@ -5435,10 +5527,15 @@ void verifyBdaReadFallbackFunctions() {
             std::size_t lookupFaults = 0;
             std::size_t lookupVariables = 0;
             std::size_t readerLookups = 0;
+            std::set<std::uint32_t> results;
+            for (std::size_t cursor = 5; cursor < five.size(); cursor += five[cursor] >> 16u) {
+                require((five[cursor] >> 16u) != 0 && (five[cursor] >> 16u) <= five.size() - cursor, "BDA read functions: truncated SPIR-V instruction");
+                if ((five[cursor] & 0xffffu) == spv::OpFunctionCall) results.insert(five.begin() + static_cast<std::ptrdiff_t>(cursor + 4), five.begin() + static_cast<std::ptrdiff_t>(cursor + (five[cursor] >> 16u)));
+            }
             for (std::size_t cursor = 5; cursor < five.size();) {
                 const auto length = five[cursor] >> 16u;
-                require(length != 0 && length <= five.size() - cursor, "BDA read functions: truncated SPIR-V instruction");
                 const auto op = five[cursor] & 0xffffu;
+                const bool resultLoad = op == spv::OpLoad && results.contains(five[cursor + 3]);
                 if (op == spv::OpName) names[five[cursor + 1]] = reinterpret_cast<const char*>(&five[cursor + 2]);
                 if (op == spv::OpFunction) {
                     function = names[five[cursor + 2]];
@@ -5454,13 +5551,13 @@ void verifyBdaReadFallbackFunctions() {
                     if (callee == "probe_bda_pointer" || callee.starts_with("read_bda_dword_bytes")) ++mainProbes;
                     if (callee == span) ++spanCalls;
                 }
-                if ((op == spv::OpLoad || op == spv::OpAtomicLoad) && function == span) ++spanLoads;
+                if ((op == spv::OpLoad || op == spv::OpAtomicLoad) && !resultLoad && function == span) ++spanLoads;
                 if (op == spv::OpFunctionCall && function == span && names[five[cursor + 3]] == loader) ++spanLoaderCalls;
-                if ((op == spv::OpLoad || op == spv::OpAtomicLoad) && function == loader) ++loaderLoads;
+                if ((op == spv::OpLoad || op == spv::OpAtomicLoad) && !resultLoad && function == loader) ++loaderLoads;
                 if (op == spv::OpFunctionCall && function == loader) ++loaderCalls;
-                if (op == spv::OpLoad && function == reader) ++readerLoads[length > 4u && (five[cursor + 4] & spv::MemoryAccessVolatileMask) != 0u];
+                if (op == spv::OpLoad && !resultLoad && function == reader) ++readerLoads[length > 4u && (five[cursor + 4] & spv::MemoryAccessVolatileMask) != 0u];
                 if (op == spv::OpFunctionCall && function == "get_bda_pointer" && names[five[cursor + 3]] == "record_bda_fault") ++lookupFaults;
-                if (op == spv::OpVariable && function == "get_bda_pointer") ++lookupVariables;
+                if (op == spv::OpVariable && function == "get_bda_pointer" && !results.contains(five[cursor + 2])) ++lookupVariables;
                 if (op == spv::OpFunctionCall && function == reader && names[five[cursor + 3]] == "get_bda_pointer") ++readerLookups;
                 cursor += length;
             }
@@ -6281,6 +6378,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--bindless") {
             verifyImageTableKeys();
             verifyImageTables();
+            verifyImageTableFunctions();
             verifyImageTableBulkReads();
             verifyImageTableScratchReuse();
             verifyImageTableBulkKeyScan();
@@ -6332,6 +6430,7 @@ int main(int argc, char** argv) {
         verifySrtTape();
         verifyImageTableKeys();
         verifyImageTables();
+        verifyImageTableFunctions();
         verifyImageTableRegistration();
         verifyDeviceImageTables();
         verifyScalarAddressRule();
