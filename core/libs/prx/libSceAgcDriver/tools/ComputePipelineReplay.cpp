@@ -1,12 +1,25 @@
 #include "ComputePipelineFixture.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PipelineCreation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -122,7 +135,82 @@ std::string Report(const Options& options, const AgcDriver::ComputePipelineCaptu
 
 }
 
+std::size_t PrivateBytes() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters));
+    return counters.PrivateUsage;
+#else
+    std::ifstream statm("/proc/self/statm");
+    std::size_t pages = 0;
+    std::size_t resident = 0;
+    statm >> pages >> resident;
+    return resident * static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+#endif
+}
+
+int Sequence(int argc, char** argv) {
+    using AgcDriver::CreationGate;
+    const auto threads = static_cast<std::size_t>(std::stoul(argv[2]));
+    const auto hold = std::stoul(argv[3]);
+    int first = 4;
+    std::size_t budgetCreations = 0;
+    if (argc >= 7 && std::string_view(argv[4]) == "--budget-creations") {
+        budgetCreations = static_cast<std::size_t>(std::stoul(argv[5]));
+        if (budgetCreations == 0) throw std::runtime_error("--budget-creations needs at least one creation");
+        first = 6;
+    }
+    std::vector<AgcDriver::ComputePipelineCapture> captures;
+    for (int index = first; index < argc; ++index) captures.push_back(AgcDriver::ComputePipelineCapture::Read(argv[index]));
+    std::size_t largest = 0;
+    for (const auto& capture : captures) largest = std::max(largest, capture.spirv.size());
+    if (budgetCreations != 0) {
+        CreationGate::SetBudgetBytes(budgetCreations * CreationGate::EstimateBytes(largest));
+        std::printf("[sequence] budget %zu bytes: %zu x the largest estimate %zu bytes (%zu words)\n", CreationGate::BudgetWords() * CreationGate::CompilerBytesPerWord, budgetCreations, CreationGate::EstimateBytes(largest), largest);
+    } else {
+        std::printf("[sequence] budget %zu bytes (default)\n", CreationGate::BudgetWords() * CreationGate::CompilerBytesPerWord);
+    }
+    const auto before = PrivateBytes();
+    AgcDriver::VulkanDevice device(AgcDriver::VulkanDevice::CompileOnly{});
+    const auto opened = PrivateBytes();
+    std::printf("[sequence] private %.1f MiB before the device, %.1f MiB with it; %zu captures on %zu threads\n", before / 1048576.0, opened / 1048576.0, captures.size(), threads);
+    std::atomic<std::size_t> next{0};
+    std::atomic<bool> running{true};
+    std::atomic<std::size_t> peakPrivate{PrivateBytes()};
+    std::thread sampler([&] {
+        while (running.load(std::memory_order_relaxed)) {
+            const auto current = PrivateBytes();
+            if (current > peakPrivate.load(std::memory_order_relaxed)) peakPrivate.store(current, std::memory_order_relaxed);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    });
+    std::mutex print;
+    std::vector<std::thread> workers;
+    for (std::size_t worker = 0; worker < threads; ++worker) {
+        workers.emplace_back([&, worker] {
+            const AgcDriver::CreationAhead ahead;
+            for (std::size_t index = next++; index < captures.size(); index = next++) {
+                const auto replay = device.ReplayComputePipeline(captures[index]);
+                std::lock_guard lock(print);
+                std::printf("[sequence] thread %zu capture %zu: %zu words, %.0f ms, private after %.1f MiB\n", worker, index, captures[index].spirv.size(), replay.pipelineMilliseconds, PrivateBytes() / 1048576.0);
+                std::fflush(stdout);
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    running = false;
+    sampler.join();
+    std::printf("[sequence] peak %zu creations at once, peak private %.1f MiB\n", CreationGate::PeakCreations(), peakPrivate.load() / 1048576.0);
+    std::printf("[sequence] all done: private %.1f MiB; holding %lu s\n", PrivateBytes() / 1048576.0, hold);
+    std::fflush(stdout);
+    std::this_thread::sleep_for(std::chrono::seconds(hold));
+    std::printf("[sequence] after hold: private %.1f MiB\n", PrivateBytes() / 1048576.0);
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc >= 5 && std::string_view(argv[1]) == "--sequence") return Sequence(argc, argv);
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "agc_compute_pipeline_replay CAPTURE|--fixture [--cache-in FILE] [--cache-out FILE] [--output FILE]\n"
                      "agc_compute_pipeline_replay --write-fixture DIRECTORY\n"

@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PipelineCreation.hpp"
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -67,6 +68,7 @@ LibraryStore& Libraries() {
 }
 
 void runJobs(LibraryStore& store) {
+    const CreationAhead ahead;
     std::unique_lock lock(store.mutex);
     for (;;) {
         store.work.wait(lock, [&] { return !store.jobs.empty() || store.stopping; });
@@ -112,7 +114,7 @@ std::span<const VkDynamicState> PipelineLibraryDynamicStates() {
     return dynamicStates;
 }
 
-VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPipelineCreateInfo& info, const VkPipelineRenderingCreateInfoKHR& rendering, const VkPipelineLayoutCreateInfo& layout, const PipelineLibraryKeys& keys, std::shared_ptr<OptimizedPipeline>* optimized, bool partsOnly, std::span<VkShaderModule> modules) {
+VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPipelineCreateInfo& info, const VkPipelineRenderingCreateInfoKHR& rendering, const VkPipelineLayoutCreateInfo& layout, const PipelineLibraryKeys& keys, std::shared_ptr<OptimizedPipeline>* optimized, bool partsOnly, std::span<VkShaderModule> modules, std::span<const std::size_t> stageWords) {
     Require(info.renderPass == VK_NULL_HANDLE && info.pDynamicState != nullptr, "pipeline library parts need dynamic rendering and the library dynamic states");
     const bool split = (layout.flags & VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT) != 0;
     Require(!split || ((layout.setLayoutCount >= 2u && layout.setLayoutCount <= 4u) && layout.pSetLayouts != nullptr && ((keys.preRasterizationSets | keys.fragmentSets) & ~((1u << layout.setLayoutCount) - 1u)) == 0u), "split pipeline library layout requires two to four descriptor set slots and a valid mask");
@@ -154,10 +156,17 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     std::vector<VkPipelineShaderStageCreateInfo> preRasterization;
     const VkPipelineShaderStageCreateInfo* fragment = nullptr;
     bool mesh = false;
+    std::array<std::size_t, 4> partWords{};
     for (std::uint32_t index = 0; index < info.stageCount; ++index) {
         const auto& stage = info.pStages[index];
-        if (stage.stage == VK_SHADER_STAGE_FRAGMENT_BIT) fragment = &stage;
-        else preRasterization.push_back(stage);
+        const auto words = index < stageWords.size() ? stageWords[index] : 0u;
+        if (stage.stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
+            fragment = &stage;
+            partWords[2] += words;
+        } else {
+            preRasterization.push_back(stage);
+            partWords[1] += words;
+        }
         mesh |= stage.stage == VK_SHADER_STAGE_MESH_BIT_EXT;
     }
     Require(fragment != nullptr && !preRasterization.empty(), "a pipeline built from libraries needs a fragment and a pre-rasterization stage");
@@ -230,6 +239,8 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         lock.unlock();
         VkResult created;
         {
+            std::optional<CreationGate> gate;
+            if (partWords[part] != 0) gate.emplace(partWords[part]);
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
             created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle);
         }
