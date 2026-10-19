@@ -2,6 +2,7 @@
 #include "PipelineSpecialization.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
+#include "SpirvBackend/SpirvImageEmitter.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -745,6 +746,7 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
     // and a read from the next write. The block may be entered right after a write.
     bool ldsWritten = true;
     bool ldsRead = false;
+    std::vector<const IrValue*> phiAnchors;
     for (const IrValue* inst : block->Instructions()) {
         if (inst->Opcode() == IrOpcode::Phi) {
             if (emittedNonPhi) {
@@ -752,6 +754,8 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
             }
         } else {
             emittedNonPhi = true;
+            for (const IrValue* anchor : phiAnchors) EmitAnchoredDeviceImageLookups(ctx, *anchor);
+            phiAnchors.clear();
         }
         if (state.waveLdsScope != 0) {
             const auto access = SharedAccessOf(inst->Opcode());
@@ -787,7 +791,12 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
             }
         }
         state.laneHalf = 0;
+        if (state.laneCount == 1u && state.deviceImageAnchors.contains(inst)) {
+            if (inst->Opcode() == IrOpcode::Phi) phiAnchors.push_back(inst);
+            else EmitAnchoredDeviceImageLookups(ctx, *inst);
+        }
     }
+    for (const IrValue* anchor : phiAnchors) EmitAnchoredDeviceImageLookups(ctx, *anchor);
 }
 
 void PatchStructuredPhis(SpirvValueEmitContext& ctx, StructuredFunctionState& functionState) {

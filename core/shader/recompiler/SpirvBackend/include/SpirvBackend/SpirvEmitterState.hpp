@@ -214,6 +214,9 @@ struct SpirvEmitterState {
     std::uint32_t deviceTableBucketsVariable = 0;
     std::uint32_t deviceTableRingVariable = 0;
     std::uint32_t deviceImageLookupFunction = 0;
+    std::uint32_t deviceImageMissFunction = 0;
+    std::map<std::vector<std::uint64_t>, std::uint32_t> deviceImageLookups;
+    std::map<const IrValue*, std::vector<const IrValue*>> deviceImageAnchors;
     std::uint32_t mainFunc = 0;
     std::uint32_t meshGuestFunc = 0;
     std::uint32_t meshAllocation = 0;

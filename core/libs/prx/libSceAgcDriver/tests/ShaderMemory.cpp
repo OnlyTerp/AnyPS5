@@ -2018,8 +2018,12 @@ ShaderRecompiler::RecompileRequest DeviceTableRequest(const std::vector<std::uin
 
 struct DeviceTableSpirvScan {
     bool lookup = false;
+    bool missRecord = false;
     bool buckets = false;
     bool ring = false;
+    std::uint32_t mainLookups = 0;
+    std::uint32_t mainMissRecords = 0;
+    std::uint32_t mainBroadcasts = 0;
     std::vector<std::uint32_t> heapBindings;
     std::vector<std::array<std::uint32_t, 4>> lookupKeys;
 };
@@ -2031,14 +2035,19 @@ DeviceTableSpirvScan ScanDeviceTableSpirv(std::span<const std::uint32_t> words) 
     std::map<std::uint32_t, std::uint32_t> constants;
     std::map<std::uint32_t, std::vector<std::uint32_t>> composites;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> calls;
+    std::map<std::uint32_t, std::string> names;
     std::uint32_t lookup = 0;
+    std::uint32_t missRecord = 0;
     for (std::size_t cursor = 5; cursor < words.size();) {
         const auto count = words[cursor] >> 16u;
         require(count != 0 && count <= words.size() - cursor, "device image tables: truncated SPIR-V instruction");
         const auto op = words[cursor] & 0xffffu;
         if (op == spv::OpName && count > 2u) {
             const auto* text = reinterpret_cast<const char*>(words.data() + cursor + 2u);
-            if (std::string_view(text, std::min<std::size_t>(std::strlen(text), (count - 2u) * 4u)) == "device_image_lookup") lookup = words[cursor + 1];
+            const std::string_view name(text, std::min<std::size_t>(std::strlen(text), (count - 2u) * 4u));
+            names[words[cursor + 1]] = std::string(name);
+            if (name == "device_image_lookup") lookup = words[cursor + 1];
+            if (name == "device_image_record_miss") missRecord = words[cursor + 1];
         }
         if (op == spv::OpDecorate && count == 4u && words[cursor + 2] == spv::DecorationDescriptorSet) sets[words[cursor + 1]] = words[cursor + 3];
         if (op == spv::OpDecorate && count == 4u && words[cursor + 2] == spv::DecorationBinding) bindings[words[cursor + 1]] = words[cursor + 3];
@@ -2047,7 +2056,20 @@ DeviceTableSpirvScan ScanDeviceTableSpirv(std::span<const std::uint32_t> words) 
         if (op == spv::OpFunctionCall && count >= 7u) calls.emplace_back(words[cursor + 3], words[cursor + 6]);
         cursor += count;
     }
+    std::string currentFunction;
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        const auto op = words[cursor] & 0xffffu;
+        if (op == spv::OpFunction && count >= 5u) currentFunction = names[words[cursor + 2]];
+        if (currentFunction == "main") {
+            if (op == spv::OpFunctionCall && count >= 4u && words[cursor + 3] == lookup) ++result.mainLookups;
+            if (op == spv::OpFunctionCall && count >= 4u && words[cursor + 3] == missRecord) ++result.mainMissRecords;
+            if (op == spv::OpGroupNonUniformBroadcastFirst) ++result.mainBroadcasts;
+        }
+        cursor += count;
+    }
     result.lookup = lookup != 0u;
+    result.missRecord = missRecord != 0u;
     for (const auto& [callee, extra] : calls) {
         const auto composite = composites.find(extra);
         if (callee != lookup || composite == composites.end() || composite->second.size() != 4u) continue;
@@ -2269,14 +2291,33 @@ void verifyDeviceImageTables() {
     const auto makeMultiSampleRequest = [&](const std::vector<std::uint32_t>& sampleCode) {
         auto req = DeviceTableRequest(sampleCode, userData, false, true);
         req.target.subgroupSize = 64u;
+        static constexpr std::array<std::uint32_t, 5> ballotCaps{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityGroupNonUniformBallot};
+        req.target.supportedCapabilities = ballotCaps;
         return req;
     };
     const auto twoSampleWords = CompileTable(makeMultiSampleRequest(twoSampleCode)).result->spirv.Words();
     const auto threeSampleWords = CompileTable(makeMultiSampleRequest(threeSampleCode)).result->spirv.Words();
+    const auto twoScan = ScanDeviceTableSpirv(twoSampleWords);
+    const auto threeScan = ScanDeviceTableSpirv(threeSampleWords);
+    require(twoScan.mainLookups == 1u && twoScan.mainMissRecords == 2u && twoScan.mainBroadcasts == 1u, "device image tables: two samples of one wave-uniform descriptor did not emit one anchored lookup, one first-lane broadcast, and two miss records");
+    require(threeScan.mainLookups == 1u && threeScan.mainMissRecords == 3u && threeScan.mainBroadcasts == 1u, "device image tables: three samples of one wave-uniform descriptor did not emit one anchored lookup, one first-lane broadcast, and three miss records");
     const auto sampleArmWords = threeSampleWords.size() - twoSampleWords.size();
-    require(sampleArmWords > 0u && sampleArmWords <= 2450u, ("device image tables: one more inline sample of a device-table texture adds " + std::to_string(sampleArmWords) + " SPIR-V words, expected at most 2450").c_str());
+    require(sampleArmWords > 0u && sampleArmWords <= 2200u, ("device image tables: one more inline sample of a device-table texture adds " + std::to_string(sampleArmWords) + " SPIR-V words, expected at most 2200").c_str());
+    const std::vector<std::uint32_t> branchSampleCode{
+        0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000030u,
+        0xbe900302u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0x7e000280u, 0x7e020500u, 0x7e040280u,
+        0xf09c0f08u, 0x00450401u, 0x06000104u,
+        0x7d880080u, 0xbf860003u,
+        0xf09c0f08u, 0x00450401u, 0x06000104u,
+        0xe0700000u, 0x80070000u, 0xbf810000u
+    };
+    const auto branchSampleWords = CompileTable(makeMultiSampleRequest(branchSampleCode)).result->spirv.Words();
+    const auto branchScan = ScanDeviceTableSpirv(branchSampleWords);
+    require(branchScan.mainLookups == 1u && branchScan.mainMissRecords == 2u && branchScan.mainBroadcasts == 1u, "device image tables: sampling one descriptor before and after a branch did not emit one lookup where the descriptor is loaded and one miss record per sample");
     const auto manyRequest = makeMultiSampleRequest(manySampleCode);
     const auto manyWords = CompileTable(manyRequest).result->spirv.Words();
+    const auto manyScan = ScanDeviceTableSpirv(manyWords);
+    require(manyScan.mainLookups == 1u && manyScan.mainMissRecords == 64u && manyScan.mainBroadcasts == 1u, "device image tables: 64 samples of one descriptor did not emit one lookup where the descriptor is loaded and 64 miss records");
     std::uint32_t manyEntry = 0;
     const auto manyFunctions = ScanTableFunctions(manyWords, manyEntry);
     require(manyFunctions.contains(manyEntry), "device image tables: the 64-sample module has no entry point function");
@@ -2287,6 +2328,7 @@ void verifyDeviceImageTables() {
     const auto& manyMain = manyFunctions.at(manyEntry);
     require(manyMain.switches == 0u && manySwitched.size() == 1u && manyFunctions.at(manySwitched[0]).dontInline && manyMain.calls.at(manySwitched[0]) == 64u, "device image tables: 64 samples of a device-table texture did not share one DontInline mode switch function once inline switches exceeded the program budget");
 #if ANYPS5_ENABLE_SPIRV_TOOLS
+    static_cast<void>(ValidateAndOptimizeSpirv(branchSampleWords, manyRequest.target.vulkanVersion, manyRequest.target.spirvVersion));
     static_cast<void>(ValidateAndOptimizeSpirv(manyWords, manyRequest.target.vulkanVersion, manyRequest.target.spirvVersion));
 #endif
 }
