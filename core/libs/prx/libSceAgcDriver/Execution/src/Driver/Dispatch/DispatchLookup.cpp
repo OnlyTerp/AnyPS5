@@ -10,8 +10,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
         static const bool validateUnlocked = std::getenv("APS5_NO_UNLOCKED_VALIDATE") == nullptr;
         std::unique_lock cacheLock(dispatchCacheMutex);
         ++entryCounters.lookups;
-        const auto found = dispatchCache.find(key);
-        std::shared_ptr<DispatchEntry> entry = found != dispatchCache.end() ? found->second : nullptr;
+        std::shared_ptr<DispatchEntry> entry = dispatchCache.Find(key);
         if (entry == nullptr) ++entryCounters.absent;
         if (validateUnlocked) cacheLock.unlock();
         phaseTiming.Phase(PhaseLookup);
@@ -93,8 +92,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             }
             if (!cacheLock.owns_lock()) cacheLock.lock();
 
-            const auto again = dispatchCache.find(key);
-            const bool untouched = again != dispatchCache.end() && again->second == entry && variants.front()->generation.load(std::memory_order_acquire) == generation;
+            const bool untouched = dispatchCache.Find(key) == entry && variants.front()->generation.load(std::memory_order_acquire) == generation;
             auto& counters = entryCounters;
             counters.validateUs += phaseMs[PhaseValidate] * 1000;
             counters.imagesFlushed += imagesFlushed;
@@ -143,23 +141,9 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 if (untouched) {
                     if (restamped != 0) variant->generation.store(restamped, std::memory_order_release);
 
-                    if (rank != 0) {
-                        auto rotated = std::make_shared<DispatchEntry>();
-                        rotated->variants.reserve(variants.size());
-                        rotated->variants.push_back(variant);
-                        for (std::size_t i = 0; i < variants.size(); ++i) {
-                            if (i != rank) rotated->variants.push_back(variants[i]);
-                        }
-                        rotated->touched = entry->touched;
-                        rotated->order = entry->order;
-                        again->second = std::move(rotated);
-                    }
+                    if (rank != 0) dispatchCache.Promote(key, rank);
 
-                    if (dispatchCacheHits - again->second->touched > dispatchCacheEntries() / 8) {
-                        dispatchOrder.splice(dispatchOrder.begin(), dispatchOrder, again->second->order);
-                        again->second->touched = dispatchCacheHits;
-                        ++counters.touches;
-                    }
+                    if (dispatchCache.Touch(key, dispatchCacheHits, dispatchCacheEntries() / 8)) ++counters.touches;
                 }
             } else {
                 if (traceCache) std::fprintf(stderr, "[dispatch-cache] 0x%llx captured memory changed\n", static_cast<unsigned long long>(address));

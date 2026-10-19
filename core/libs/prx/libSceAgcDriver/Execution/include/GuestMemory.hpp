@@ -27,6 +27,12 @@ struct Commitment {
 };
 Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writable = false);
 void CopyGuestBytes(void* destination, const void* source, std::size_t bytes);
+struct TableReservation {
+    const void* base = nullptr;
+    std::size_t bytes = 0;
+};
+std::vector<TableReservation> TableReservations();
+std::size_t StampTableBytes();
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment = 1);
 // Variants for resources in heaps the guest commits on demand (partially resident textures, GPU
 // scratch heaps): uncommitted pages read as zeros, are not compared, and are never stored.
@@ -36,6 +42,8 @@ bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes);
 // EqualsCommitted without the flush hook: the caller has decided that the recorded GPU work
 // writing the range need not be waited for (the dispatch-cache validation in Driver.cpp).
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes);
+std::uint64_t Digest(std::span<const std::byte> bytes);
+std::uint64_t DigestCommitted(std::uint64_t address, std::size_t bytes);
 // EqualsCommittedUnsynced for a caller that treats an unmapped page as a miss (the dispatch-cache
 // validation's per-run compare): one walk of the page states, one memcmp per mapped run, no profile
 // counter and no reason string. Unmapped: some page of the range is not readable (or the address

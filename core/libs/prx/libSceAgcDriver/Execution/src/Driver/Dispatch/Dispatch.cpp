@@ -273,9 +273,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         bool entryFound = false;
         {
             std::lock_guard cacheLock(dispatchCacheMutex);
-            if (const auto found = dispatchCache.find(key); found != dispatchCache.end()) {
+            if (const auto found = dispatchCache.Find(key)) {
                 entryFound = true;
-                for (const auto& variant : found->second->variants) appendEntryRegions(*variant, reads);
+                for (const auto& variant : found->variants) appendEntryRegions(*variant, reads);
             }
         }
         if (!entryFound || noDispatchCache || stampValidate()) {

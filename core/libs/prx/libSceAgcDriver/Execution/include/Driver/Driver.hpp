@@ -121,9 +121,7 @@ private:
     static std::size_t dispatchVariants();
     static bool insertCompare();
     static std::size_t dispatchCacheEntries();
-    static std::uint64_t variantBytes(const DispatchVariant& variant);
-    void accountVariant(const DispatchVariant& variant, bool added);
-    void eraseDispatchEntry(std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>>::iterator it);
+    static std::uint64_t dispatchCacheBudget();
     void classifyDiffering(std::uint64_t program, std::uint64_t key, const DispatchVariant& old, const DispatchVariant& fresh, const ShaderRecompiler::ResourceCapture* capture, EntryCounters& counters);
     void reportDispatchCache(EntryCounters& counters);
     void lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering);
@@ -347,22 +345,16 @@ private:
     std::atomic<std::uint64_t> eventSerial{0};
     alignas(64) std::shared_ptr<ShaderRegistry> shaders = std::make_shared<ShaderRegistry>();
 
-    std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>> dispatchCache;
-
-    std::list<std::uint64_t> dispatchOrder;
+    DispatchEntries dispatchCache{dispatchCacheEntries(), dispatchCacheBudget()};
     std::mutex dispatchCacheMutex;
     std::uint64_t dispatchCacheHits = 0;
     std::uint64_t dispatchCacheEvictions = 0;
-
-    std::uint64_t dispatchCacheVariants = 0;
-    std::uint64_t dispatchCacheVariantBytes = 0;
 
     EntryCounters entryCounters;
 
     std::atomic<std::uint64_t> dataPendingMisses{0};
 
-    using ValueSet = std::pair<std::vector<std::pair<std::uint64_t, std::uint64_t>>, std::vector<std::uint32_t>>;
-    std::unordered_map<std::uint64_t, std::deque<ValueSet>> priorValueSets;
+    PriorValueSets priorValueSets{dispatchCacheEntries()};
 
     std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawCache;
     std::unordered_map<std::uint64_t, std::uint64_t> drawShapes;
