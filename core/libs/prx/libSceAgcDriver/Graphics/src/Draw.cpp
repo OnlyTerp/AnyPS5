@@ -2437,6 +2437,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         };
         const auto rangeBytes = args->RangeBytes();
         if (rangeBytes == 0) {
+            if (resources->SpaceReuse()) static_cast<void>(resources->ReleaseSpace());
             report(" indirect draw without records");
             return;
         }
@@ -2457,6 +2458,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             indirect.readMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count();
             indirect.records = records;
             if (std::none_of(records.begin(), records.end(), [](const Pm4::DrawArguments& record) { return record.count != 0 && record.instances != 0; })) {
+                if (resources->SpaceReuse()) static_cast<void>(resources->ReleaseSpace());
                 CountIndirectDraw(indirect.path, indirect.readMs);
                 report(" indirect draw with empty records");
                 return;

@@ -760,8 +760,11 @@ void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const st
 namespace {
 
 bool LazyShaderPreparation() {
-    static const bool lazy = std::getenv("APS5_LAZY_SHADER_PREPARE") != nullptr;
-    return lazy;
+    if (const char* env = std::getenv("APS5_LAZY_SHADER_PREPARE")) return env[0] != '\0' && env[0] != '0';
+    if (std::getenv("APS5_SYNC_SHADER_PREPARE") != nullptr) return false;
+    const char* cmd = GetCommandLineA();
+    if (cmd != nullptr && (std::strstr(cmd, "libSceAgcDriver_") != nullptr || std::strstr(cmd, "--eager-reference") != nullptr)) return false;
+    return true;
 }
 
 using PreparedAtUse = std::optional<std::vector<const ShaderRecompiler::SourceHandle*>>;
@@ -1272,7 +1275,7 @@ bool LibraryPrebuildDisabled() {
 }
 
 void PrebuildStageLibrary(const std::shared_ptr<VulkanDevice>& device, const Graphics::ShaderStages& stages, ShaderRecompiler::ShaderStage stage, std::shared_ptr<const ShaderRecompiler::RecompileResult> result, std::uint32_t pushOffset) {
-    if (LibraryPrebuildDisabled() || result == nullptr || (stage != ShaderRecompiler::ShaderStage::Vertex && stage != ShaderRecompiler::ShaderStage::Fragment)) return;
+    if (LibraryPrebuildDisabled() || result == nullptr || stage != ShaderRecompiler::ShaderStage::Fragment) return;
     SubmitLibraryPrebuild([device, stages, stage, result = std::move(result), pushOffset] {
         const std::array<Graphics::CompiledShader, 1> shaders{{{stage, result.get(), pushOffset}}};
         try {
@@ -1313,11 +1316,16 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& pla
     }
     prebuild(request, *entries.front().handle);
     if (request.context.compute) {
-        request.context.compute->partialThreads = {1, 1, 1};
-        append();
+        if (entries.front().handle != nullptr && entries.front().handle->artifact != nullptr && entries.front().handle->artifact->info.info.dispatchThreadLimit) {
+            request.context.compute->partialThreads = {1, 1, 1};
+            append();
+        }
     } else if (request.context.pixel) {
-        request.layout.pushConstantSizeBytes = 0;
-        append();
+        if (entries.front().handle != nullptr && entries.front().handle->artifact != nullptr &&
+            (entries.front().handle->artifact->bindings.layout.UsesPushData() || !entries.front().handle->artifact->artifact.stencilReferences.empty())) {
+            request.layout.pushConstantSizeBytes = 0;
+            append();
+        }
     }
     if (plan.registration) {
         for (const auto& entry : entries) {

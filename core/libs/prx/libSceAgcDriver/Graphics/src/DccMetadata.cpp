@@ -519,7 +519,7 @@ DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoi
 
 DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t guestBytes, bool& memoized) {
     memoized = false;
-    if (resource.dccAddress == 0) return DccKeys::Uncompressed;
+    if (resource.dccAddress == 0 || resource.tileMode == TextureTileMode::kZ64KBX) return DccKeys::Uncompressed;
     DccKeys keys;
     if (const auto known = WaitForKeyWriters(resource, guestBytes)) keys = *known;
     else keys = currentDccKeys(resource.dccAddress, DccKeyBytes(guestBytes), memoized);
@@ -672,7 +672,7 @@ bool KeyFastPath() {
 }
 
 DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t guestBytes, DccKeyProof& proof) {
-    if (resource.dccAddress == 0) return DccKeys::Uncompressed;
+    if (resource.dccAddress == 0 || resource.tileMode == TextureTileMode::kZ64KBX) return DccKeys::Uncompressed;
     auto& counters = Proofs();
     if (!KeyFastPath()) {
         counters.scanned.fetch_add(1, std::memory_order_relaxed);

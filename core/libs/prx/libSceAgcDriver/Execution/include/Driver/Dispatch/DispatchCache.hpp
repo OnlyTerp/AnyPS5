@@ -23,7 +23,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-inline constexpr std::size_t MaxDispatchVariants = 8;
+inline constexpr std::size_t MaxDispatchVariants = 16;
 
 struct DispatchVariant {
 
@@ -48,6 +48,7 @@ struct DispatchVariant {
     std::uint64_t relocatableWords = 0;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> shaderDataPatches;
     std::uint64_t userDataMask = ~std::uint64_t{0};
+    std::vector<std::uint32_t> userData;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
     bool ring = false;
     std::shared_ptr<const std::vector<ShaderRecompiler::VertexAttribute>> ringAttributes;
@@ -58,6 +59,7 @@ struct DispatchVariant {
     std::vector<ShaderRecompiler::MemoryRegion> captured;
     std::vector<std::pair<std::uint64_t, std::size_t>> spans;
     std::atomic<std::uint64_t> generation{0};
+    mutable std::uint32_t drawCacheRefs = 0;
 };
 
 struct DispatchEntry {

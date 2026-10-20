@@ -520,6 +520,7 @@ private:
         const StorageTexture* source = nullptr;
         bool depth = false;
         bool valid = false;
+        std::array<std::uint64_t, 4> untracked{};
     };
     void captureValidation();
     // A surface of this object the fast proof found a foreign image pending over: the element

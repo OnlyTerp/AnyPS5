@@ -1344,8 +1344,9 @@ ImportRun joinedRun(const GuestAllocations::Lease& lease, std::uint64_t begin, s
     if (window == 0) return {};
     auto run = crossedRun(lease, begin, end);
     if (run.ranges.empty()) return run;
-    if (std::all_of(run.ranges.begin(), run.ranges.end(), [window](const auto& range) { return range->bytes > window; })) return run;
+    if (std::all_of(run.ranges.begin(), run.ranges.end(), [window](const auto& range) { return range->bytes >= window; })) return run;
     if (begin == run.base && end == run.base + run.bytes) return run;
+    if (end - begin > (1ull << 20u)) return run;
     return {};
 }
 
@@ -1536,8 +1537,8 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
 }
 
 const HostImport* importJoined(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease) {
-    if (const auto* low = peekImport(state, begin, begin + 1); low != nullptr && low->joined) begin = low->base;
-    if (const auto* high = peekImport(state, end - 1, end); high != nullptr && high->joined) end = high->base + high->bytes;
+    if (const auto* low = peekImport(state, begin, begin + 1); low != nullptr && (low->joined || low->ranges.size() > 1)) begin = std::min(begin, low->base);
+    if (const auto* high = peekImport(state, end - 1, end); high != nullptr && (high->joined || high->ranges.size() > 1)) end = std::max(end, high->base + high->bytes);
     auto run = joinedRun(lease, begin, end);
     if (run.ranges.empty()) return nullptr;
     if (const auto failed = state.failedJoins.find(run.base); failed != state.failedJoins.end() && sameRun(failed->second, run)) return nullptr;
@@ -3837,7 +3838,7 @@ void GuestBufferMemory::AddReadable(std::uint64_t address, std::size_t bytes) {
 }
 
 bool GuestBufferMemory::SpaceOnly() const {
-    return space != nullptr && lease.empty() && regions.empty() && space->sparseMirrors.empty() && space->copied.empty();
+    return space != nullptr && lease.empty() && regions.empty() && space->copied.empty();
 }
 
 std::shared_ptr<const void> GuestBufferMemory::ReleaseSpace() {
@@ -3888,14 +3889,20 @@ bool GuestBufferMemory::RetakeSpace() {
     {
         auto& state = Imports();
         std::lock_guard lock(state.mutex);
-        if (current->device != context.device || current->generation != generation || current->importsEpoch != state.epoch) return false;
+        const auto keeps = [&](ImageMirror* mirror) { return heapMirrorWatched(*mirror) || !importsNow(context, state, current->lease, mirror->base); };
+        if (current->device != context.device || current->generation != generation || current->importsEpoch != state.epoch || !std::all_of(current->heapMirrors.begin(), current->heapMirrors.end(), keeps) || !std::all_of(current->sparseMirrors.begin(), current->sparseMirrors.end(), keeps)) return false;
         importFloor = state.useCounter + 1;
         const auto stamp = ++state.useCounter;
         for (const auto* import : current->directImports) import->lastUse = stamp;
     }
+    std::vector<RefreshBlock> blocks;
+    for (auto* mirror : current->sparseMirrors) {
+        if (refreshSparseMirror(*mirror, blocks)) continue;
+        spaces.current.compare_exchange_strong(current, std::shared_ptr<const AddressSpace>{});
+        return false;
+    }
     spaces.hits.fetch_add(1, std::memory_order_relaxed);
     space = std::move(current);
-    std::vector<RefreshBlock> blocks;
     const auto epoch = GuestMemory::CollectEpoch();
     const auto proof = GuestMemory::ProofSerial();
     const bool reuse = epochMirrors() && epoch != 0 && space->refreshedEpoch.load(std::memory_order_relaxed) == epoch && space->refreshedProof.load(std::memory_order_relaxed) == proof;
@@ -3974,7 +3981,10 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
         // descriptors and specialization still equal what the GPU reads. APS5_NO_SNAPSHOT_CHECK=1
         // skips the compare of live-backed regions (the region serves the GPU whatever the snapshot
         // held; only the diagnostic is lost).
-        static const bool checkLive = std::getenv("APS5_NO_SNAPSHOT_CHECK") == nullptr;
+        static const bool checkLive = [] {
+            const char* noCheck = std::getenv("APS5_NO_SNAPSHOT_CHECK");
+            return (noCheck != nullptr && std::strcmp(noCheck, "0") == 0) || std::getenv("APS5_SNAPSHOT_CHECK_FATAL") != nullptr;
+        }();
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
         const bool live = owner->writable || owner->hostBacked || owner->mirror != nullptr;
         // A live region over a unit shadow's fresh results reads the import's stale bytes here

@@ -286,7 +286,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             if (known != drawRelocations.end()) {
                 auto& trial = drawRelocationTrials[drawIdentity];
                 if (trial.idle != 0) --trial.idle;
-                else relocation = known->second;
+                else if (!known->second->words.empty()) relocation = known->second;
                 aliasFirst = relocation != nullptr && trial.productive;
             }
         }
@@ -335,7 +335,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 else if (traceShapes.contains(shapeKey)) ++counters.absentUserWords;
                 else ++counters.absentNewRegisters;
             }
-            if (decode == nullptr && drawDataHits() && !drawParameters.indirect) {
+            if (decode == nullptr && drawDataHits()) {
                 if (const auto shape = drawShapes.find(shapeKey); shape != drawShapes.end()) {
                     const auto kept = drawCache.find(shape->second);
                     if (kept != drawCache.end() && kept->second->decode != nullptr && kept->second->shape == shapeKey) dataEntry = kept->second;
@@ -786,8 +786,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate->first);
                 if (stageData[i].compiled != nullptr && verifyDrawDataHits()) verifyStageData(i);
             }
-            if (dataEntry != nullptr && reused[i]) ++dataStagesReused;
-            else if (dataEntry != nullptr) ++dataStagesCompiled;
+            if ((entry != nullptr || dataEntry != nullptr) && reused[i]) ++dataStagesReused;
+            else if (entry != nullptr || dataEntry != nullptr) ++dataStagesCompiled;
         }
         if (!tail.cpuImageTables && !expectDeviceImages(localDevice, program.userData, program.binary.codeAddress, *programResults[i], false)) tail.cpuImageTables = true;
         const auto& result = *programResults[i];
@@ -807,13 +807,13 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         std::lock_guard cacheLock(drawCacheMutex);
         drawEntryCounters.stageDataVerified += stageDataVerified;
     }
-    if (dataEntry != nullptr) {
+    if (entry != nullptr || dataEntry != nullptr) {
         std::lock_guard cacheLock(drawCacheMutex);
         drawEntryCounters.dataStagesReused += dataStagesReused;
         drawEntryCounters.dataStagesCompiled += dataStagesCompiled;
         drawEntryCounters.dataVerified += dataVerified;
     }
-    const bool shapeRefresh = Graphics::DrawPipelineEnabled();
+    const bool shapeRefresh = true;
     const auto refreshSeenTwice = [&] {
         std::uint64_t data = shapeKey;
         bool stored = false;
@@ -830,10 +830,18 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             }
         }
         if (!stored) return false;
-        static std::array<std::atomic<std::uint64_t>, 4096> lastData{};
-        return lastData[shapeKey % lastData.size()].exchange(data, std::memory_order_relaxed) == data;
+        static std::mutex seenMutex;
+        static std::array<std::array<std::uint64_t, 8>, 4096> lastData{};
+        static std::array<std::uint8_t, 4096> nextSlot{};
+        std::lock_guard seenLock(seenMutex);
+        auto& bucket = lastData[shapeKey % lastData.size()];
+        if (std::find(bucket.begin(), bucket.end(), data) != bucket.end()) return true;
+        auto& slot = nextSlot[shapeKey % lastData.size()];
+        bucket[slot] = data;
+        slot = static_cast<std::uint8_t>((slot + 1u) % bucket.size());
+        return false;
     };
-    const bool shapeNeedsEntry = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0 && refreshSeenTwice();
+    const bool shapeNeedsEntry = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && dataEntry != nullptr && dataStagesCompiled != 0 && refreshSeenTwice();
     cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry);
     timing.Mark("shader_compile_and_link");
 
@@ -946,7 +954,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             std::set<std::size_t> patched;
             const auto patch = [&](const std::optional<std::pair<std::size_t, std::size_t>>& word, std::uint32_t value) {
                 if (!word) return;
+                if (programs[word->first].userData[word->second] == value) return;
                 programs[word->first].userData[word->second] = value;
+                const auto mask = matched[word->first] != nullptr ? matched[word->first]->userDataMask : stageCaptures[word->first].userDataMask;
+                if (word->second < 64u && ((mask >> word->second) & 1u) == 0u) return;
                 patched.insert(word->first);
             };
             patch(baseVertexWord, indirect.recordBytes == 20 ? arguments.vertexOffset : arguments.firstVertexOrIndex);
@@ -968,8 +979,12 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 direct.firstVertex = indirect.indxOffset;
             }
             if (graphics.stages.mesh) {
-                setMeshIndexBuffer(direct);
-                patched.insert(0);
+                const auto descriptor = Graphics::MeshIndexBufferDescriptor(direct);
+                auto& words = programs.front().userData;
+                if (!std::equal(descriptor.begin(), descriptor.end(), words.begin() + ShaderRecompiler::MeshIndexBufferUserWord)) {
+                    std::copy(descriptor.begin(), descriptor.end(), words.begin() + ShaderRecompiler::MeshIndexBufferUserWord);
+                    patched.insert(0);
+                }
             }
             for (const auto programIndex : patched) {
                 auto& result = results[resultIndex[programIndex]];
@@ -982,7 +997,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             }
             fold(*programResults[0], direct);
             if (graphics.rectList && patched.contains(0)) buildRectList();
-            snapshot();
+            if (!patched.empty()) snapshot();
             if (auto known = localDevice->KnownDrawRejection(graphics, stages)) {
                 rejected = std::move(*known);
                 return DrawVerdict::Rejected;
@@ -1032,7 +1047,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             return DrawVerdict::Rejected;
         }
     }
-    if (pipelined && !drawParameters.indirect && (tail.queue == nullptr || deferredLabels().labels.empty())) {
+    if (pipelined && (!drawParameters.indirect || pipelinedIndirect) && (tail.queue == nullptr || deferredLabels().labels.empty())) {
         if (!gpuLock.owns_lock() && !drawHit) static_cast<void>(localDevice->PrepareDrawPipelines(graphics, stages));
         phaseTiming.Phase(DrawRowVectors);
         auto writes = drawWriteRanges(graphics, stages);

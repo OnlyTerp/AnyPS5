@@ -103,6 +103,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
 
                 std::optional<SampledReadScope> sampling;
+                std::size_t failedStage = programs.size();
                 for (std::size_t i = 0; !miss && i < programs.size(); ++i) {
                     if (roles[i] == Role::GeometryBack) continue;
                     ++stageValidations;
@@ -144,9 +145,37 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         break;
                     }
                     if (matched[i] != nullptr) continue;
+                    failedStage = i;
                     if (!anyLayout) miss = DrawMiss::Layout;
                     else if (outcome != EntryOutcome::Differing) miss = DrawMiss::Gate;
                     else miss = roles[i] == Role::Fragment ? DrawMiss::FragmentDiffering : i == 0 ? DrawMiss::FrontDiffering : DrawMiss::OtherDiffering;
+                }
+                if (miss && drawDataHits() && (graphics.stages.path == Graphics::ShaderPath::Vertex || graphics.stages.mesh.has_value()) && entry->stages.size() == programs.size()) {
+                    for (std::size_t i = 0; i < programs.size(); ++i) {
+                        if (roles[i] == Role::GeometryBack) continue;
+                        if (i < failedStage) {
+                            if (matched[i] != nullptr && stageData[i].compiled == nullptr) {
+                                dataCandidates[i].emplace_back(std::move(matched[i]), std::move(matchedRegions[i]));
+                            } else {
+                                matched[i].reset();
+                                matchedRegions[i].clear();
+                                stageData[i] = {};
+                            }
+                            continue;
+                        }
+                        if (i == failedStage) continue;
+                        auto& candidates = dataCandidates[i];
+                        for (const auto& variant : entry->stages[i]) {
+                            if (heapRefused && variant->compiled->gpuResolvedImages) continue;
+                            if (programs[i].binary.stage == ShaderRecompiler::ShaderStage::Mesh && !std::equal(variant->meshIndexDescriptor.begin(), variant->meshIndexDescriptor.end(), programs[i].userData.begin() + ShaderRecompiler::MeshIndexBufferUserWord)) continue;
+                            if (std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.first->pushOffset == variant->pushOffset; })) continue;
+                            std::vector<ShaderRecompiler::MemoryRegion> regions;
+                            appendEntryRegions(*variant, regions);
+                            auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
+                            if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
+                            if (result == EntryOutcome::Equal) candidates.emplace_back(variant, std::move(regions));
+                        }
+                    }
                 }
             }
             drawHit = !miss;
@@ -186,7 +215,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         rotated->order = entry->order;
                         again->second = std::move(rotated);
                     }
-                    if (drawCacheHits - again->second->touched > drawCacheEntries() / 8) {
+                    if (drawCacheHits - again->second->touched > 64) {
                         drawOrder.splice(drawOrder.begin(), drawOrder, again->second->order);
                         again->second->touched = drawCacheHits;
                         ++counters.touches;
@@ -210,19 +239,21 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 phaseMs[DrawRowValidateWait] += waited;
                 counters.validateUs += phaseMs[DrawRowKeyLookupValidate] * 1000;
             }
-        } else if (dataEntry != nullptr && graphics.stages.path == Graphics::ShaderPath::Vertex && dataEntry->stages.size() == programs.size() && dataEntry->decode->programs.size() == programs.size()) {
+        } else if (dataEntry != nullptr && (graphics.stages.path == Graphics::ShaderPath::Vertex || graphics.stages.mesh.has_value()) && dataEntry->stages.size() == programs.size() && dataEntry->decode->programs.size() == programs.size()) {
             std::uint64_t imagesFlushed = 0, runsSynced = 0;
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
             std::optional<SampledReadScope> sampling;
             for (std::size_t i = 0; i < programs.size(); ++i) {
                 if (roles[i] == Role::GeometryBack || programs[i].userData.size() != dataEntry->decode->programs[i].userData.size()) continue;
                 const auto& now = programs[i].userData;
-                const auto& was = dataEntry->decode->programs[i].userData;
                 auto& candidates = dataCandidates[i];
                 for (const auto& variant : dataEntry->stages[i]) {
                     if (heapRefused && variant->compiled->gpuResolvedImages) continue;
+                    const auto& was = variant->userData.size() == now.size() ? variant->userData : dataEntry->decode->programs[i].userData;
+                    if (programs[i].binary.stage == ShaderRecompiler::ShaderStage::Mesh && !std::equal(variant->meshIndexDescriptor.begin(), variant->meshIndexDescriptor.end(), now.begin() + ShaderRecompiler::MeshIndexBufferUserWord)) continue;
                     bool usedEqual = true;
                     for (std::size_t w = 0; w < now.size() && usedEqual; ++w) {
+                        if (programs[i].binary.stage == ShaderRecompiler::ShaderStage::Mesh && w >= ShaderRecompiler::MeshIndexBufferUserWord && w < ShaderRecompiler::MeshIndexBufferUserWord + variant->meshIndexDescriptor.size()) continue;
                         if (now[w] != was[w] && (w >= 64u || ((variant->userDataMask >> w) & 1u) != 0)) usedEqual = false;
                     }
                     if (!usedEqual) continue;

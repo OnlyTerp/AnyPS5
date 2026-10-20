@@ -21,7 +21,9 @@ namespace {
 struct RamSide {
     std::mutex mutex;
     std::chrono::steady_clock::time_point sampled{};
+    std::chrono::steady_clock::time_point guestSampled{};
     std::size_t guestMapped = 0;
+    std::size_t cachedRamSide = 0;
     CreationGate::MemorySource deviceLocal = nullptr;
 };
 
@@ -102,13 +104,18 @@ std::size_t CreationGate::RamSideBytes() {
     auto& state = RamSideState();
     std::lock_guard lock(state.mutex);
     const auto now = std::chrono::steady_clock::now();
-    if (state.sampled == std::chrono::steady_clock::time_point{} || now - state.sampled >= std::chrono::seconds(1)) {
-        state.guestMapped = GuestMappedBytes();
-        state.sampled = now;
+    if (state.sampled != std::chrono::steady_clock::time_point{} && now - state.sampled < std::chrono::milliseconds(250)) {
+        return state.cachedRamSide;
     }
+    if (state.guestSampled == std::chrono::steady_clock::time_point{} || now - state.guestSampled >= std::chrono::seconds(5)) {
+        state.guestMapped = GuestMappedBytes();
+        state.guestSampled = now;
+    }
+    state.sampled = now;
     const auto total = PrivateBytes() + state.guestMapped;
     const auto deviceLocal = state.deviceLocal != nullptr ? state.deviceLocal() : 0u;
-    return total > deviceLocal ? total - deviceLocal : 0u;
+    state.cachedRamSide = total > deviceLocal ? total - deviceLocal : 0u;
+    return state.cachedRamSide;
 }
 
 void CreationGate::UseRamSide(MemorySource deviceLocal) {

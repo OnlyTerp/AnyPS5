@@ -84,6 +84,10 @@ void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderReco
         return (relocatable >> found->second & 1u) != 0 ? static_cast<std::int8_t>(found->second) : std::int8_t {-1};
     };
     variant.relocatableWords = relocatable;
+    std::size_t totalWords = 0;
+    for (const auto& region : regions) totalWords += region.bytes.size() / sizeof(std::uint32_t);
+    variant.words.reserve(totalWords);
+    if (relocatable == 0) variant.runs.reserve(regions.size());
     for (std::size_t index = 0; index < regions.size(); ++index) {
         const auto& region = regions[index];
         const auto count = region.bytes.size() / sizeof(std::uint32_t);
@@ -219,6 +223,18 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             copy->runBases = variant->runBases;
             copy->relocatableWords = variant->relocatableWords;
             copy->words = variant->words;
+            for (const auto& span : variant->shared) {
+                bool spanMoved = false;
+                for (std::size_t r = span.region; r < span.region + span.regions && r < copy->runBases.size(); ++r) {
+                    if (std::any_of(moves.begin(), moves.end(), [&](const Move& move) { return move.program == i && copy->runBases[r] == static_cast<std::int8_t>(move.index); })) {
+                        spanMoved = true;
+                        break;
+                    }
+                }
+                if (!spanMoved) copy->shared.push_back(span);
+            }
+            copy->userDataMask = variant->userDataMask;
+            copy->userData = variant->userData;
             copy->forgetSerial = variant->forgetSerial;
             copy->compiled = variant->compiled;
             copy->meshIndexDescriptor = variant->meshIndexDescriptor;
@@ -230,6 +246,7 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             copy->vertexInfo = variant->vertexInfo;
             for (const auto& move : moves) {
                 if (move.program != i) continue;
+                if (move.index < copy->userData.size()) copy->userData[move.index] = move.to;
                 const auto delta = AlignedWord(move.to) - AlignedWord(move.from);
                 for (std::size_t run = 0; run < copy->runs.size() && run < copy->runBases.size(); ++run) {
                     if (copy->runBases[run] != static_cast<std::int8_t>(move.index)) continue;
@@ -243,6 +260,7 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             }
             relocated->stages[i].push_back(std::move(copy));
         }
+        if (relocated->stages[i].empty()) return;
     }
     patches.clear();
     for (const auto& move : moves) patches.push_back({move.program, move.index, move.to});

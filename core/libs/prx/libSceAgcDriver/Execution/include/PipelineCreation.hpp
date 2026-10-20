@@ -26,7 +26,7 @@ private:
 class CreationGate {
 public:
     static constexpr std::size_t CompilerBytesPerWord = 12288;
-    static constexpr std::size_t MemoryLimitBytes = std::size_t{16} << 30u;
+    static constexpr std::size_t MemoryLimitBytes = std::size_t{32} << 30u;
     using MemorySource = std::size_t (*)();
 
     explicit CreationGate(std::size_t words) : words(words) {

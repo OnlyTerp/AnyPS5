@@ -2831,37 +2831,57 @@ void EmitImageBvhIntersectRay(SpirvValueEmitContext& ctx, const IrValue& inst) {
             inverse[axis] = half(3u + axis);
         }
 
-        const auto nodeDwords = [&](std::uint32_t count) {
+        const auto loadLine = [&](std::uint32_t baseOffset, std::uint32_t lineCount, std::uint32_t guardCond) {
             std::vector<std::uint32_t> dwords;
             if (state.bdaProbeFunction == 0) {
-                for (std::uint32_t first = 0; first < count; first += 4u) {
-                    const auto read = EmitBdaDwordReads(ctx, inst, nodeAddress, first * 4u, 4u, true);
-                    dwords.insert(dwords.end(), read.begin(), read.end());
+                for (std::uint32_t first = 0; first < lineCount; first += 4u) {
+                    const auto read = EmitValueOrDefaultIfCondition(state, guardCond, result4, ConstantU32CompositeZero(state, 4u), [&] {
+                        const auto vals = EmitBdaDwordReads(ctx, inst, nodeAddress, baseOffset + first * 4u, 4u, true);
+                        return compose({vals[0], vals[1], vals[2], vals[3]});
+                    });
+                    for (std::uint32_t i = 0; i < 4u; ++i) {
+                        const auto value = state.module.AllocateId();
+                        state.module.AddFunction(spv::OpCompositeExtract, u32, value, read, i);
+                        dwords.push_back(value);
+                    }
                 }
                 return dwords;
             }
             const auto pc = uint(inst.Flags<MemoryFlags>().pc);
-            const auto bytes = uint(count * 4u);
+            const auto lineAddress = baseOffset == 0u ? nodeAddress : op(spv::OpIAdd, u64, nodeAddress, BdaConstant(state, baseOffset));
+            const auto bytes = uint(lineCount * 4u);
             const auto physical = state.module.AllocateId();
-            state.module.AddFunction(spv::OpFunctionCall, u64, physical, state.bdaProbeFunction, nodeAddress, bytes, pc);
+            state.module.AddFunction(spv::OpFunctionCall, u64, physical, state.bdaProbeFunction, lineAddress, bytes, pc);
             const auto mapped = both(op(spv::OpINotEqual, boolean, physical, BdaConstant(state, 0u)), op(spv::OpIEqual, boolean, op(spv::OpBitwiseAnd, u64, physical, BdaConstant(state, 3u)), BdaConstant(state, 0u)));
-            EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, mapped), [&] { RecordBdaFault(state, nodeAddress, bytes, pc, BdaAbi::FaultReason::Unmapped); });
-            for (std::uint32_t first = 0; first < count; first += 4u) {
-                const auto quad = EmitValueOrDefaultIfCondition(state, mapped, result4, ConstantU32CompositeZero(state, 4u), [&] {
-                    std::array<std::uint32_t, 4> values{};
-                    for (std::uint32_t i = 0; i < 4u; ++i) {
-                        const auto pointer = state.module.AllocateId();
-                        state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, op(spv::OpIAdd, u64, physical, BdaConstant(state, (first + i) * 4u)));
-                        values[i] = state.module.AllocateId();
-                        state.module.AddFunction(spv::OpLoad, u32, values[i], pointer, spv::MemoryAccessAlignedMask, 4u);
-                    }
-                    return compose(values);
+            for (std::uint32_t first = 0; first < lineCount; first += 4u) {
+                const auto quad = EmitValueOrDefaultIfCondition(state, guardCond, result4, ConstantU32CompositeZero(state, 4u), [&] {
+                    return EmitValueOrDefaultIfCondition(state, mapped, result4, ConstantU32CompositeZero(state, 4u), [&] {
+                        std::array<std::uint32_t, 4> values{};
+                        for (std::uint32_t i = 0; i < 4u; ++i) {
+                            const auto pointer = state.module.AllocateId();
+                            state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, op(spv::OpIAdd, u64, physical, BdaConstant(state, (first + i) * 4u)));
+                            values[i] = state.module.AllocateId();
+                            state.module.AddFunction(spv::OpLoad, u32, values[i], pointer, spv::MemoryAccessAlignedMask, 4u);
+                        }
+                        return compose(values);
+                    });
                 });
                 for (std::uint32_t i = 0; i < 4u; ++i) {
                     const auto value = state.module.AllocateId();
                     state.module.AddFunction(spv::OpCompositeExtract, u32, value, quad, i);
                     dwords.push_back(value);
                 }
+            }
+            return dwords;
+        };
+        const auto nodeDwords = [&](std::uint32_t count) {
+            const auto firstCount = std::min(count, 16u);
+            auto dwords = loadLine(0u, firstCount, valid);
+            if (count > 16u) {
+                const auto invalidChild = uint(0xffffffffu);
+                const auto hasTailChildren = both(valid, op(spv::OpLogicalOr, boolean, op(spv::OpINotEqual, boolean, dwords[2], invalidChild), op(spv::OpINotEqual, boolean, dwords[3], invalidChild)));
+                const auto tail = loadLine(64u, count - 16u, hasTailChildren);
+                dwords.insert(dwords.end(), tail.begin(), tail.end());
             }
             return dwords;
         };

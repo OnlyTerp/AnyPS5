@@ -56,22 +56,30 @@ bool Driver::verifyDrawRecipe() {
     return verify;
 }
 
+std::uint64_t drawCacheByteBudget() {
+    return std::uint64_t{16384} << 20u;
+}
+
 std::size_t Driver::drawCacheEntries() {
     static const std::size_t entries = [] {
         const char* text = std::getenv("APS5_DRAW_CACHE_ENTRIES");
         const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
-        return parsed != 0 ? static_cast<std::size_t>(parsed) : std::size_t{4096};
+        return parsed != 0 ? static_cast<std::size_t>(parsed) : std::size_t{32768};
     }();
     return entries;
 }
 
 void Driver::accountDrawVariant(const DispatchVariant& variant, bool added) {
     if (added) {
-        ++drawCacheVariants;
-        drawCacheVariantBytes += DispatchVariantBytes(variant);
+        if (variant.drawCacheRefs++ == 0) {
+            ++drawCacheVariants;
+            drawCacheVariantBytes += DispatchVariantBytes(variant);
+        }
     } else {
-        --drawCacheVariants;
-        drawCacheVariantBytes -= DispatchVariantBytes(variant);
+        if (variant.drawCacheRefs > 0 && --variant.drawCacheRefs == 0) {
+            --drawCacheVariants;
+            drawCacheVariantBytes -= DispatchVariantBytes(variant);
+        }
     }
 }
 
@@ -126,18 +134,41 @@ bool Driver::admitDrawKey(std::uint64_t key, std::uint64_t shape) {
 void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape, bool replaceShape) {
     std::lock_guard cacheLock(drawCacheMutex);
     auto& counters = drawEntryCounters;
+    const auto compatibleWithProgram = [](const DispatchVariant& v, const DrawProgram& prog) {
+        if (v.userData.size() != prog.userData.size()) return false;
+        if (prog.binary.stage == ShaderRecompiler::ShaderStage::Mesh && !std::equal(v.meshIndexDescriptor.begin(), v.meshIndexDescriptor.end(), prog.userData.begin() + ShaderRecompiler::MeshIndexBufferUserWord)) return false;
+        for (std::size_t w = 0; w < prog.userData.size(); ++w) {
+            if (prog.binary.stage == ShaderRecompiler::ShaderStage::Mesh && w >= ShaderRecompiler::MeshIndexBufferUserWord && w < ShaderRecompiler::MeshIndexBufferUserWord + v.meshIndexDescriptor.size()) continue;
+            if (v.userData[w] != prog.userData[w] && (w >= 64u || ((v.userDataMask >> w) & 1u) != 0)) return false;
+        }
+        return true;
+    };
+    bool keptShapeOwner = false;
+    if (shape != 0) {
+        if (const auto shapeOf = drawShapes.find(shape); shapeOf != drawShapes.end() && shapeOf->second != key) {
+            if (const auto previous = drawCache.find(shapeOf->second); previous != drawCache.end() && previous->second->decode != nullptr && previous->second->stages.size() == fresh.size() && previous->second->decode->programs.size() == fresh.size()) {
+                keptShapeOwner = true;
+                for (std::size_t i = 0; i < fresh.size(); ++i) {
+                    if (fresh[i] == nullptr || !compatibleWithProgram(*fresh[i], previous->second->decode->programs[i])) continue;
+                    auto& pvars = previous->second->stages[i];
+                    const auto present = std::find_if(pvars.begin(), pvars.end(), [&](const std::shared_ptr<DispatchVariant>& kept) { return kept.get() == fresh[i].get() || (kept->pushOffset == fresh[i]->pushOffset && kept->meshIndexDescriptor == fresh[i]->meshIndexDescriptor && kept->runs == fresh[i]->runs && kept->userData == fresh[i]->userData && SameCapturedWords(kept->words, kept->shared, fresh[i]->words, fresh[i]->shared)); });
+                    if (present != pvars.end()) continue;
+                    accountDrawVariant(*fresh[i], true);
+                    pvars.insert(pvars.begin(), fresh[i]);
+                    while (pvars.size() > dispatchVariants()) {
+                        accountDrawVariant(*pvars.back(), false);
+                        pvars.pop_back();
+                    }
+                }
+                if (replaceShape) {
+                    ++counters.shapeUpdates;
+                    return;
+                }
+            }
+        }
+    }
     if (replaceShape && shape != 0) {
         ++counters.shapeUpdates;
-        if (const auto shapeOf = drawShapes.find(shape); shapeOf != drawShapes.end() && shapeOf->second != key) {
-            if (const auto previous = drawCache.find(shapeOf->second); previous != drawCache.end()) {
-                for (const auto& variants : previous->second->stages) {
-                    for (const auto& variant : variants) accountDrawVariant(*variant, false);
-                }
-                drawOrder.erase(previous->second->order);
-                drawCache.erase(previous);
-            }
-            drawShapes.erase(shapeOf);
-        }
     } else {
         ++counters.inserts;
     }
@@ -170,7 +201,7 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
         }
     }
     replacement->touched = drawCacheHits;
-    if (replacement->decode != nullptr && shape != 0) drawShapes[shape] = key;
+    if (replacement->decode != nullptr && shape != 0 && !keptShapeOwner) drawShapes[shape] = key;
     if (found == drawCache.end()) {
         drawOrder.push_front(key);
         replacement->order = drawOrder.begin();
@@ -180,7 +211,7 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
         drawOrder.splice(drawOrder.begin(), drawOrder, replacement->order);
         found->second = std::move(replacement);
     }
-    while (drawCache.size() > drawCacheEntries()) {
+    while (!drawOrder.empty() && (drawCache.size() > drawCacheEntries() || (drawCacheVariantBytes > drawCacheByteBudget() && drawCache.size() > 1))) {
         const auto last = drawCache.find(drawOrder.back());
         for (const auto& variants : last->second->stages) {
             for (const auto& variant : variants) accountDrawVariant(*variant, false);

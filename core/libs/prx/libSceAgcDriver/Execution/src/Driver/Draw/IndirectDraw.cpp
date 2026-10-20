@@ -59,7 +59,10 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
         const auto extent = stride == 0 ? static_cast<std::uint64_t>(attribute.resource.fields[2]) : static_cast<std::uint64_t>(attribute.resource.fields[2]) * stride;
         if (extent > vertexCap) fail(Path::VertexRange);
     }
-    if (traceIndirect) {
+    static const bool profileDraw = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static std::atomic<std::uint32_t> profileIndirectPrinted{0};
+    const auto indirectSample = profileIndirectPrinted.fetch_add(1, std::memory_order_relaxed);
+    if (traceIndirect || (profileDraw && indirectCpu && (indirectSample < 12 || (indirectSample % 2000 == 0 && indirectSample <= 40000)))) {
         const auto location = [](std::uint32_t value, std::int32_t sgpr) { char text[24]; if (value == 0x280u) std::snprintf(text, sizeof(text), "none"); else std::snprintf(text, sizeof(text), "0x%x(s%d)", value, sgpr); return std::string(text); };
         const auto rule = [](Rule value, std::uint32_t constant) { char text[24]; if (value == Rule::InPlace) std::snprintf(text, sizeof(text), "in-place"); else std::snprintf(text, sizeof(text), "const %u", constant); return std::string(text); };
         std::string decision = indirectCpu ? "cpu (" + std::string(Graphics::IndirectDrawPathName(*indirectCpu)) + ")" : "gpu vertex=" + rule(indirect.vertexRule, indirect.vertexConstant) + " instance=" + rule(indirect.instanceRule, indirect.instanceConstant);

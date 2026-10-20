@@ -32,7 +32,7 @@ std::size_t Driver::dispatchVariants() {
     static const std::size_t variants = [] {
         if (stampValidate()) return std::size_t{1};
         const char* text = std::getenv("APS5_DISPATCH_VARIANTS");
-        const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 4ull;
+        const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 8ull;
         return static_cast<std::size_t>(std::clamp<unsigned long long>(parsed, 1, MaxDispatchVariants));
     }();
     return variants;
@@ -48,8 +48,8 @@ std::size_t Driver::dispatchCacheEntries() {
         const char* text = std::getenv("APS5_DISPATCH_CACHE_ENTRIES");
         const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
         if (parsed != 0) return static_cast<std::size_t>(parsed);
-        if (stampValidate()) return std::size_t{4096};
-        return dispatchVariants() > 2 ? std::size_t{8192} : std::size_t{16384};
+        if (stampValidate()) return std::size_t{16384};
+        return dispatchVariants() > 2 ? std::size_t{16384} : std::size_t{65536};
     }();
     return entries;
 }
@@ -58,7 +58,7 @@ std::uint64_t Driver::DispatchCacheBytes() {
     static const std::uint64_t bytes = [] {
         const char* text = std::getenv("APS5_DISPATCH_CACHE_BYTES");
         const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
-        return parsed != 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{256} << 20u;
+        return parsed != 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{384} << 20u;
     }();
     return bytes;
 }
@@ -77,7 +77,7 @@ std::uint64_t Driver::dispatchCacheBudget() {
         if (pages <= 0 || page <= 0) throw std::runtime_error("dispatch cache: cannot read the physical memory size");
         const std::uint64_t physical = static_cast<std::uint64_t>(pages) * static_cast<std::uint64_t>(page);
 #endif
-        return std::min<std::uint64_t>(DispatchCacheBytes(), physical / 64);
+        return std::min<std::uint64_t>(DispatchCacheBytes(), physical / 32);
     }();
     return budget;
 }

@@ -4957,6 +4957,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recorder.MarkCovered(dispatchedAccess);
     recordStep(PhaseRecordBind);
     resources.MarkGpuWrites(recorder);
+    if (resources.SpaceReuse()) recorder.Keep(std::const_pointer_cast<void>(resources.ReleaseSpace()));
     recordStep(PhaseRecordMarks);
     // Only copied written buffers (and BDA fault checks) need work once the GPU is done; without them
     // the batch can signal its labels from the GPU.
@@ -5245,8 +5246,18 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         const bool exactEntry = prepared != nullptr && prepared->exact;
         contentKey = prepared != nullptr && !prepared->key.empty() ? std::move(prepared->key) : DispatchContentKey(shaders[0], context.device);
         auto cached = preparedFind && prepared != nullptr && prepared->cached != nullptr ? std::move(prepared->cached) : state->resourceCache.Find(contentKey);
+        const auto revalidateCandidate = [&](const std::shared_ptr<Graphics::ShaderResources>& candidate) {
+            bool spaceHeld = !candidate->SpaceReuse();
+            if (!spaceHeld && candidate->RetakeSpace()) {
+                spaceHeld = candidate->SnapshotsServedInPlace(snapshots);
+                if (!spaceHeld) static_cast<void>(candidate->ReleaseSpace());
+            }
+            if (spaceHeld && candidate->Revalidate(shaders[0])) return true;
+            if (spaceHeld && candidate->SpaceReuse()) static_cast<void>(candidate->ReleaseSpace());
+            return false;
+        };
         if (cached != nullptr) {
-            if (cached->Revalidate(shaders[0])) {
+            if (revalidateCandidate(cached)) {
                 bool usable = true;
                 if (DispatchMove() && !exactEntry) {
                     auto& moves = DispatchMoves();
@@ -5274,10 +5285,11 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                     }
                 }
                 if (!usable) {
+                    if (cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                     contentKey = DispatchContentKey(shaders[0], context.device, false);
                     refusedMove = true;
                     cached = state->resourceCache.Find(contentKey);
-                    if (cached != nullptr && cached->Revalidate(shaders[0])) usable = true;
+                    if (cached != nullptr && revalidateCandidate(cached)) usable = true;
                     else if (cached != nullptr) {
                         state->resourceCache.Remove(contentKey, cached.get());
                         ++d.cacheInvalidated;
@@ -5358,6 +5370,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     // The indirect hold total below still covers the whole call of a CPU-resolved one.
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;
+    const bool heldLease = resources->HoldsLease();
     recordDispatch(record);
     timing.Mark("command_record");
     timer.phase(PhaseRecord);
@@ -5366,12 +5379,12 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     // when the batch finished (deferred lease release, see Graphics::SyncLeaseWork): a guest thread
     // that needs a leased allocation syncs the recorder itself through the registry's pin waiter.
     // APS5_SYNC_LEASE_DISPATCH=1 completes such dispatches at once, as before.
-    if (SyncEachDispatch() || (resources->HoldsLease() && Graphics::SyncLeaseWork())) {
+    if (SyncEachDispatch() || (heldLease && Graphics::SyncLeaseWork())) {
         Graphics::Recorder::CountSync(3);
         const auto syncStart = std::chrono::steady_clock::now();
         recorder.Sync();
         timer.phase(PhaseSync);
-        if (resources->HoldsLease()) Graphics::CountLeaseOutcome(true, 0);
+        if (heldLease) Graphics::CountLeaseOutcome(true, 0);
         if (profile) {
             // APS5_PROFILE_DRAW: the [recorder] line's "address-based" syncs by program, every 10 s,
             // so the programs still waiting here are known (under the GpuMutex, like the rest).
@@ -5397,7 +5410,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                 byProgram.clear();
             }
         }
-    } else if (resources->HoldsLease()) {
+    } else if (heldLease) {
         // The lease is in the open batch (kept above, nothing submitted since): the pin waiter
         // finishes the recorder up to that batch's serial. Prints the [address-sync] leases line.
         Graphics::CountLeaseOutcome(false, recorder.Submissions() + 1);
@@ -5408,7 +5421,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     // object the resource cache serves under this content key (reusable: no lease, no copied
     // writes, every direct region import- or mirror-served), so a hit's proof is the template's
     // Revalidate and nothing needs completion work.
-    if (recipeOut != nullptr && DispatchRecipes() && cacheable && overlay == nullptr && resources->Reusable() && !resources->NeedsCompletion() && objects != nullptr && !contentKey.empty()) {
+    if (recipeOut != nullptr && DispatchRecipes() && cacheable && overlay == nullptr && resources->Reusable() && !resources->SpaceReuse() && !resources->NeedsCompletion() && objects != nullptr && !contentKey.empty()) {
         auto recipe = std::make_shared<Recipe>();
         recipe->device = state->device;
         recipe->templateRef = resources;

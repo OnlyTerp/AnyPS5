@@ -1801,7 +1801,9 @@ std::shared_ptr<const RecompileResult> RegistrationResult(const RecompileRequest
     if (handle.artifact == nullptr || !MatchesPreparedShader(request, handle)) throw std::runtime_error("ShaderRecompiler: prepared artifact does not match the static ABI");
     if (!request.target.registrationModules || !handle.artifact->artifact.registrationModule) return nullptr;
     const auto& info = handle.artifact->info.info;
-    if (std::ranges::any_of(info.buffers, [](const BufferResource& buffer) { return buffer.descriptorFormatted; }) || std::ranges::any_of(info.samplers, [](const SamplerResource& sampler) { return FoldsTexelOffsets(sampler); })) return nullptr;
+    if (std::ranges::any_of(info.buffers, [](const BufferResource& buffer) { return buffer.descriptorFormatted; }) ||
+        std::ranges::any_of(info.images, [](const ImageResource& image) { return image.table != NoTable && !image.deviceTable; }) ||
+        std::ranges::any_of(info.samplers, [](const SamplerResource& sampler) { return sampler.table != NoTable || FoldsTexelOffsets(sampler); })) return nullptr;
     ResourceSnapshot snapshot;
     snapshot.buffers.assign(info.buffers.size(), {{}, 4u});
     snapshot.images.assign(info.images.size(), {{}, 8u});
